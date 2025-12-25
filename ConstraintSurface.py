@@ -7,16 +7,19 @@ __license__ = "LGPL 2.1+"
 import FreeCAD as App
 import Part
 
-def draw_vector(point, vector, color=(1.0,0,0), scale=10.0, name_prefix="Vec"):
+def draw_vector(point, vector, color=(1.0,0,0), scale=10.0, name_prefix="Vec", show=True):
     """
     Method to draw a vector as a line in FreeCAD for visualization.
     
     Args:
-    point: Starting point (App.Vector)
-    vector: Vector to draw (App.Vector)
-    color: Line color (r,g,b)
-    scale: Scale factor for vector length if vector is unit length
-    name_prefix: Name prefix for the object
+        point: Starting point (App.Vector)
+        vector: Vector to draw (App.Vector)
+        color: Line color (r,g,b)
+        scale: Scale factor for vector length if vector is unit length
+        name_prefix: Name prefix for the object
+        show: Whether to create the object in FreeCAD document
+    Returns:
+        Part.Edge or None: The created edge or None if vector is invalid
     """
     if vector is None or vector.Length < 1e-9:
         return None
@@ -31,30 +34,54 @@ def draw_vector(point, vector, color=(1.0,0,0), scale=10.0, name_prefix="Vec"):
     p2 = point.add(end)
     edge = Part.makeLine(p1, p2)
 
-    obj = App.ActiveDocument.addObject("Part::Feature", name_prefix)
-    obj.Shape = edge
-    obj.ViewObject.ShapeColor = color
-    obj.ViewObject.LineColor = color
-    obj.ViewObject.PointColor = color
-    return obj
+    if show:
+        obj = App.ActiveDocument.addObject("Part::Feature", name_prefix)
+        obj.Shape = edge
+        obj.ViewObject.ShapeColor = color
+        obj.ViewObject.LineColor = color
+        obj.ViewObject.PointColor = color
+    return edge
 
-def draw_points(points, color=(1.0,0,0), size=2.0, name="Pt"):    
+def draw_points(points, color=(1.0,0,0), size=2.0, name="Pt", show=True):    
     """
     Method to draw points as spheres in FreeCAD for visualization.
 
     Args:
-    points: List of points (App.Vector)
-    color: Sphere color (r,g,b)
-    size: Sphere radius
-    name: Name for the object
+        points: List of points (App.Vector)
+        color: Sphere color (r,g,b)
+        size: Sphere radius
+        name: Name for the object
+        show: Whether to create the object in FreeCAD document
+    Returns:
+        Part.Compound or None: The Compound of spheres or None if not shown
+    """    
+    compound = Part.makeCompound([Part.makeSphere(size, point) for point in points])
+
+    if show:
+        obj = App.ActiveDocument.addObject("Part::Feature", name)
+        obj.Shape = compound
+        obj.ViewObject.ShapeColor = color
+        obj.ViewObject.LineColor = color
+        obj.ViewObject.PointColor = color
+    return compound
+
+def show_object(shape, name="DebugShape", color=(0.0,1.0,0.0)):
+    """
+    Show a shape in FreeCAD for debugging.
+
+    Args:
+        shape: Part.Shape
+        name: Name for the object
+        color: Color (r,g,b)
+    Returns:
+        Part.Feature or None: The created object or None if not shown
     """
     obj = App.ActiveDocument.addObject("Part::Feature", name)
-    obj.Shape = Part.makeCompound([Part.makeSphere(size, point) for point in points])
+    obj.Shape = shape
     obj.ViewObject.ShapeColor = color
     obj.ViewObject.LineColor = color
     obj.ViewObject.PointColor = color
     return obj
-
 
 def insert_uniform_knots(bs, along_v, target_poles=8, tol=1e-9):
     """
@@ -881,6 +908,10 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         # --- ORTHOGONAL: store all ---
         delta_orthogonal[i][j].append(d_orth)
     
+    # for debugging only!
+    deltas_V = []
+    deltas_U = []
+
     # Process each driver
     for drv in drivers:
         driver_face = drv['driver_face']
@@ -926,6 +957,13 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
 
             delta = App.Vector(g1_row[j]).sub(P_orig)
 
+            # For debugging only
+            # if along_v:
+            #     deltas_V.append(P_orig.add(delta))
+            # else:
+            #     deltas_U.append(P_orig.add(delta))
+            ######
+
             if is_rational:
                 add_delta(i, jj, delta, orig_weights[i][jj])
             else:
@@ -954,9 +992,16 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
                 # Scale by falloff weight for this row distance
                 applied_delta = delta.multiply(w)
 
+                # For debugging only
+                # if along_v:
+                #     deltas_V.append(P_orig.add(applied_delta))
+                # else:
+                #     deltas_U.append(P_orig.add(applied_delta))
+                ######
+    
                 # Map indices correctly for delta accumulation depending on along_v
                 i, jj = (r, j) if along_v else (j, r)
-
+                
                 # Rational: keep original weights (no blending here)
                 if is_rational:
                     add_delta(i, jj, applied_delta, orig_weights[i][jj])
@@ -964,51 +1009,60 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
                     add_delta(i, jj, applied_delta)
 
         
-        def v_avg(vecs):
-            v = App.Vector(0,0,0)
-            for vec in vecs:
-                v = v.add(vec)
-            return v.multiply(1.0 / len(vecs))
-        
-        def w_avg(ws):
-            d = 0.0
-            for w in ws:
-                d += w
-            return d / len(ws)
-        
-        # Compute final poles by averaging deltas
-        if collision_mode == 'average':
-            for i in range(nu):
-                for j in range(nv):
-                    if len(delta_avg[i][j]) > 0:
-                        new_pole = orig_poles[i][j].add(v_avg(delta_avg[i][j]))
-                        bs.setPole(i + 1, j + 1, new_pole)
-                        if is_rational:
-                            avg_weight = orig_weights[i][j]
-                            if weights and len(weights[i][j]) > 0:
-                                avg_weight = w_avg(weights[i][j])
-                            bs.setWeight(i + 1, j + 1, avg_weight)
-        # Compute final poles by derectionaly averaging deltas
-        elif collision_mode == 'directional_clamp':
-            for i in range(nu):
-                for j in range(nv):
-                    d = App.Vector(0,0,0)
+    def v_avg(vecs):
+        v = App.Vector(0,0,0)
+        for vec in vecs:
+            v = v.add(vec)
+        return v.multiply(1.0 / len(vecs))
+    
+    def w_avg(ws):
+        d = 0.0
+        for w in ws:
+            d += w
+        return d / len(ws)
+    
+    # Debug: show poles and deltas
+    # poles = []
+    # for i in range(nu):
+    #     for j in range(nv):
+    #         poles.append(orig_poles[i][j])
+    # draw_points(poles, color=(0.0,1.0,0.0), size=0.2, name="Original_Poles")
+    # draw_points(deltas_U, color=(0.0,0.0,1.0), size=0.2, name="Deltas_U")
+    # draw_points(deltas_V, color=(1.0,0.0,0.0), size=0.2, name="Deltas_V")
+    
+    # Compute final poles by averaging deltas
+    if collision_mode == 'average':
+        for i in range(nu):
+            for j in range(nv):
+                if len(delta_avg[i][j]) > 0:
+                    new_pole = orig_poles[i][j].add(v_avg(delta_avg[i][j]))
+                    bs.setPole(i + 1, j + 1, new_pole)
+                    if is_rational:
+                        avg_weight = orig_weights[i][j]
+                        if weights and len(weights[i][j]) > 0:
+                            avg_weight = w_avg(weights[i][j])
+                        bs.setWeight(i + 1, j + 1, avg_weight)
+    # Compute final poles by derectionaly averaging deltas
+    elif collision_mode == 'directional_clamp':
+        for i in range(nu):
+            for j in range(nv):
+                d = App.Vector(0,0,0)
 
-                    if delta_parallel[i][j]:
-                        d = d.add(delta_parallel[i][j])
+                if delta_parallel[i][j]:
+                    d = d.add(delta_parallel[i][j])
 
-                    if len(delta_orthogonal[i][j]) > 0:
-                        d = d.add(v_avg(delta_orthogonal[i][j]))
+                if len(delta_orthogonal[i][j]) > 0:
+                    d = d.add(v_avg(delta_orthogonal[i][j]))
 
-                    if d.Length > 1e-9:
-                        new_pole = orig_poles[i][j].add(d)
-                        bs.setPole(i + 1, j + 1, new_pole)
+                if d.Length > 1e-9:
+                    new_pole = orig_poles[i][j].add(d)
+                    bs.setPole(i + 1, j + 1, new_pole)
 
-                        if is_rational:
-                            avg_weight = orig_weights[i][j]
-                            if weights and len(weights[i][j]) > 0:
-                                avg_weight = w_avg(weights[i][j])
-                            bs.setWeight(i + 1, j + 1, avg_weight)
+                    if is_rational:
+                        avg_weight = orig_weights[i][j]
+                        if weights and len(weights[i][j]) > 0:
+                            avg_weight = w_avg(weights[i][j])
+                        bs.setWeight(i + 1, j + 1, avg_weight)
     return bs
 
 def getSelectedFaces():
@@ -1038,21 +1092,22 @@ for f in driver_faces:
         'driver_face': f,   # tool face
         'samples': 30,      # number of samples along edge
         'beta': 1.0,        # blending factor (0.0 - 1.0). Higher = stronger driver influence.
-        'spread_rows': 5,   # number of rows to spread corrections over. Higher = smoother transition, but spreading will not go past half the surface.
+        'spread_rows': 4,   # number of rows to spread corrections over. Higher = smoother transition, but spreading will not go past half the surface.
         'falloff': 0.6      # falloff factor for spreading (0.0 - 1.0). Lower = faster falloff.
     })
 
 # Optional: refinement before G1 enforcement
 g1_refinement = {
     "enabled": True,
-    "min_poles_u": 9,
-    "min_poles_v": 12,
+    "min_poles_u": 8,
+    "min_poles_v": 8,
     "boundary_bias": 1.2,
     "tol": 1e-9
 }
 
 #bs = enforce_G1_multiple(target_face, drivers, collision_mode='average') # more gentle corners blending
 bs = enforce_G1_multiple(target_face, drivers, collision_mode='directional_clamp', refinement=g1_refinement) # better G1 in tight corners
+
 new_face = Part.Face(bs)
 
 doc = App.ActiveDocument
