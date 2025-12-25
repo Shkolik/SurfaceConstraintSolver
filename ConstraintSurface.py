@@ -4,8 +4,11 @@ __title__ = "Surface tangency solver"
 __author__ = "Andrew Shkolik"
 __license__ = "LGPL 2.1+"
 
+import math
 import FreeCAD as App
 import Part
+
+### Debug visualization utilities ###
 
 def draw_vector(point, vector, color=(1.0,0,0), scale=10.0, name_prefix="Vec", show=True):
     """
@@ -83,6 +86,8 @@ def show_object(shape, name="DebugShape", color=(0.0,1.0,0.0)):
     obj.ViewObject.PointColor = color
     return obj
 
+#### Core functionality ###
+
 def insert_uniform_knots(bs, along_v, target_poles=8, tol=1e-9):
     """
     Insert uniform knots into a BSplineSurface to reach at least target pole count.
@@ -146,7 +151,7 @@ def insert_uniform_knots(bs, along_v, target_poles=8, tol=1e-9):
 
     return modified
 
-def insert_boundary_biased_knots(bs, along_v, boundary_index, target_poles=8, bias=3.0, tol=1e-9):
+def insert_boundary_biased_knots(bs, along_v, boundary_index, layers=3, bias=3.0, tol=1e-9):
     """
     Insert knots clustered near a boundary to increase DOF
     without deforming the surface.
@@ -155,7 +160,7 @@ def insert_boundary_biased_knots(bs, along_v, boundary_index, target_poles=8, bi
         bs (Part.BSplineSurface)
         along_v (bool): True → boundary is U=const (refine V)
         boundary_index (int): 0 or max index of boundary row/column
-        target_poles (int): minimum number of poles in that direction        
+        layers (int): number of layers to insert
         bias (float): >1 clusters knots near boundary
         tol (float) : knot insertion tolerance
     Returns:
@@ -166,24 +171,17 @@ def insert_boundary_biased_knots(bs, along_v, boundary_index, target_poles=8, bi
     # --- Direction setup ---
     if along_v:
         # Boundary is U=const → refine V
-        get_nb_poles = lambda: bs.NbVPoles
-        get_knots   = lambda:  bs.getVKnots()
+        get_knots   = lambda: bs.getVKnots()
         get_mults   = lambda: bs.getVMultiplicities()
         insert_knot = lambda u: bs.insertVKnot(u, 1, tol)
         param_min, param_max = bs.bounds()[2:4]
     else:
         # Boundary is V=const → refine U
-        get_nb_poles = lambda: bs.NbUPoles
         get_knots   = lambda: bs.getUKnots()
         get_mults   = lambda: bs.getUMultiplicities()
         insert_knot = lambda u: bs.insertUKnot(u, 1, tol)
         param_min, param_max = bs.bounds()[0:2]
-
-    cur_poles = get_nb_poles()
-    if cur_poles >= target_poles:
-        return  modified # nothing to do
     
-    layers = target_poles - cur_poles
 
     # --- Boundary parameter ---
     at_start = (boundary_index == 0)
@@ -221,47 +219,199 @@ def insert_boundary_biased_knots(bs, along_v, boundary_index, target_poles=8, bi
 
     return modified
 
-def ensure_min_dof(target_face, drivers, min_u=8, min_v=8, boundary_bias=1.0, tol=1e-9):
+def transverse_curvature_proxy(surface, point, transverse_dir, tol=1e-9):
     """
-    Ensure the BSpline surface has at least min_u and min_v poles.
+    Approximate geometric curvature magnitude in transverse direction.
     Args:
-        target_face: Part.Face
-        drivers: List of driver dictionaries
-        min_u: Minimum number of U poles
-        min_v: Minimum number of V poles
-        boundary_bias: Bias toward boundary
-        tol: Tolerance for knot insertion
-    Returns: Part.BSplineSurface with ensured minimum degrees of freedom
+        surface: (Part.Surface) driver surface
+        point: (App.Vector) origin point
+        transverse_dir: (App.Vector) direction (unit)
+        tol: (float) tolerance for first derivative
+    """    
+    u, v = surface.parameter(point)
+
+    # First derivatives (world space)
+    Du = surface.getDN(u, v, 1, 0)
+    Dv = surface.getDN(u, v, 0, 1)
+
+    # Second derivatives
+    Duu = surface.getDN(u, v, 2, 0)
+    Dvv = surface.getDN(u, v, 0, 2)
+    Duv = surface.getDN(u, v, 1, 1)
+
+    # Solve Td ≈ a*Du + b*Dv (least squares)
+
+    # Normal equation coefficients
+    suu = Du.dot(Du)
+    svv = Dv.dot(Dv)
+    suv = Du.dot(Dv)
+
+    rhs_u = transverse_dir.dot(Du)
+    rhs_v = transverse_dir.dot(Dv)
+
+    det = suu * svv - suv * suv
+    if abs(det) < 1e-12:
+        # Fallback: Project onto dominant direction
+        if Du.Length > Dv.Length:
+            d1 = Du
+            d2 = Duu
+        else:
+            d1 = Dv
+            d2 = Dvv
+
+        if d1.Length < tol:
+            return 0.0
+
+        return d2.Length / (d1.Length * d1.Length)
+
+    inv = 1.0 / det
+    a = inv * ( rhs_u * svv - rhs_v * suv )
+    b = inv * ( rhs_v * suu - rhs_u * suv )
+
+    # First derivative along transverse_dir
+    d1 = Du.multiply(a).add(Dv.multiply(b))
+    d1_len = d1.Length
+    if d1_len < tol:
+        return 0.0
+
+    # Second derivative along transverse_dir
+    d2 = (
+        Duu.multiply(a * a)
+        .add(Dvv.multiply(b * b))
+        .add(Duv.multiply(2.0 * a * b))
+    )
+
+    # Geometric curvature magnitude
+    return d2.Length / (d1_len * d1_len)
+
+def sample_boundary_curvature(surface, edge, transverse_dirs):
     """
-    bs = target_face.Surface.copy()
-    modified = False
+    Returns curvature values per boundary sample.
+    Args:
+        surface: (Part.Surface) driver surface
+        edge: (Part.Edge) shared edge
+        transverse_dirs: list of (App.Vector) (unit) or None
+    Returns:    
+        curvatures: list of float curvature values
+    """
+    u0, u1 = edge.ParameterRange
+    samples = len(transverse_dirs)
+    curvatures = []
 
-    if boundary_bias > 1.0:
-        # Refine near boundaries based on drivers
-        for drv in drivers:
-            driver_face = drv['driver_face']
-            edge = find_shared_edge(target_face, driver_face)
-            if edge is None:
+    for i in range(samples):
+        t = u0 + (u1 - u0) * i / (samples - 1)
+        p = edge.Curve.value(t)
+
+        Td = transverse_dirs[i]
+        if Td is None:
+            curvatures.append(0.0)
+            continue
+
+        k = transverse_curvature_proxy(surface, p, Td)
+        curvatures.append(k)
+
+    return curvatures
+
+def curvature_weighted_params(params, curvatures, layers=3, min_weight=0.1):
+    """
+    Generate parameter locations biased by curvature.
+    Args:
+        params: list of (float) parameter locations
+        curvatures: list of (float) curvature values
+        layers: (int) number of layers to insert
+        min_weight: (float) minimum weight to avoid zero insertions
+    Returns:
+        list of (float) new parameter locations
+    """
+    if not params or not curvatures:
+        return []
+
+    # Normalize curvature
+    max_k = max(curvatures)
+    if max_k < 1e-9:
+        return []
+
+    weights = [max(k / max_k, min_weight) for k in curvatures]
+
+    selected = []
+    used = set()
+
+    for _ in range(layers):
+        # Pick strongest unused location
+        best_i = None
+        best_k = -1
+
+        for i, k in enumerate(weights):
+            if i in used:
                 continue
-            
-            along_v, boundary_index = detect_edge_direction_and_boundary(bs, edge)
-            target_poles = min_u if along_v else min_v
-            modified |= insert_boundary_biased_knots(bs, not along_v, boundary_index, bias=boundary_bias, target_poles=target_poles, tol=tol)
+            if k > best_k:
+                best_k = k
+                best_i = i
+
+        if best_i is None:
+            break
+
+        selected.append(params[best_i])
+        used.add(best_i)
+
+    return selected
+
+def insert_curvature_weighted_knots(bs, along_v, boundary_index, 
+                                    edge, curvatures, layers=3, tol=1e-9):
+    """
+    Insert knots near boundary weighted by transverse curvature.
+    Args:
+        bs: (Part.BSplineSurface) surface to refine (MODIFIED IN PLACE)
+        along_v: (bool) True → boundary is U=const (refine V)
+        boundary_index: (int) 0 or max index of boundary row/column
+        edge: (Part.Edge) shared edge
+        curvatures: list of (float) geometric curvature values per sample
+        layers: (int) number of layers to insert
+        tol: (float) knot insertion tolerance
+    """
+    if curvatures is None or len(curvatures) == 0:
+        return False
+    
+    samples = len(curvatures)
+
+    # Direction setup
+    if along_v:
+        insert = lambda t: bs.insertVKnot(t, 1, tol)
+        param_min, param_max = bs.bounds()[2:4]
     else:
-        nu, nv = bs.NbUPoles, bs.NbVPoles
-        if nu < min_u:
-            modified |= insert_uniform_knots(bs, along_v=False, target_poles=min_u, tol=tol)
+        insert = lambda t: bs.insertUKnot(t, 1, tol)
+        param_min, param_max = bs.bounds()[0:2]
 
-        if nv < min_v:
-            modified |= insert_uniform_knots(bs, along_v=True, target_poles=min_v, tol=tol)
+    u0, u1 = edge.ParameterRange
+    params = [u0 + (u1 - u0) * i / (samples - 1) for i in range(samples)]
 
-    ''' Debug: visualize modified surface'''
-    '''
-    if modified:
-        obj = App.ActiveDocument.addObject("Part::Feature", "ModifiedSurface")
-        obj.Shape = Part.Face(bs.copy())
-    '''
-    return bs
+    # Compute insert locations
+    refine_params = curvature_weighted_params(
+        params,
+        curvatures,
+        layers=layers
+    )
+
+    # Map edge parameter → surface parameter
+    eps = (param_max - param_min) * 1e-6
+    at_start = (boundary_index == 0)
+    boundary_param = param_min if at_start else param_max
+
+    modified = False
+    for t in refine_params:
+        s = (t - u0) / (u1 - u0)
+        d = s * (param_max - param_min) * 0.5
+
+        if at_start:
+            u = boundary_param + d
+        else:
+            u = boundary_param - d
+
+        u = max(param_min + eps, min(param_max - eps, u))
+        insert(u)
+        modified = True
+
+    return modified
 
 def is_straight_line(edge, tol=1e-7):
     """
@@ -507,6 +657,10 @@ def transverse_derivative_basis(surface, point, edge_tangent):
     """
     Return orthonormal basis vectors spanning the surface's transverse
     derivative space at this boundary point.
+    Args:
+        surface: (Part.Surface) driver surface
+        point: (App.Vector) point on surface
+        edge_tangent: (App.Vector) unit vector tangent to edge
     """
     u, v = surface.parameter(point)
 
@@ -624,13 +778,11 @@ def sample_driver_tangents(driver_face, edge, samples, row_len):
         driver_face: Driver surface (Part.Face)
         edge: Shared edge (Part.Edge)
         samples: Number of samples along the edge
-        row_len: Number of poles in the target row
-
+        row_len: Number of poles in the target row. If None, no interpolation will be done.
     Returns:
-        tangent_at_pole_dir: list of App.Vector (unit) or None
+        list of App.Vector (unit) or None
     """
     u0, u1 = edge.ParameterRange
-    surface = driver_face.Surface
 
     tangents = [] # tangent directions at samples
 
@@ -658,6 +810,10 @@ def sample_driver_tangents(driver_face, edge, samples, row_len):
 
         tangents.append(d_dir)
 
+    if not row_len:
+        return tangents
+    
+    # Interpolate to match row_len
     tangent_at_pole_dir = []
 
     for j in range(row_len):
@@ -809,6 +965,60 @@ def get_spread_rows(boundary_index, spread_rows, nu, nv, along_v):
 
     return rows
 
+def pole_spacing(poles, along_v, boundary_index):
+    """
+    Gets pole spacing near boundary
+    
+    Args:
+    poles: surface poles as 2D list [nu][nv] of App.Vector
+    along_v: direction of boundary
+    boundary_index: index of boundary row/column (0-based)
+    """
+    step = 1 if boundary_index == 0 else -1
+    if along_v:
+        # spacing in V (rows)        
+        p0 = poles[boundary_index]
+        p1 = poles[boundary_index + step]
+    else:
+        p0 = [row[boundary_index] for row in poles]
+        p1 = [row[boundary_index + step] for row in poles]
+
+    spacings = [(p1[i].sub(p0[i])).Length for i in range(len(p0))]
+    return sum(spacings) / len(spacings)
+
+def estimate_refinement_layers(h, kappa, tol=0.25):
+    """
+    Estimate the number of refinement layers needed based on pole spacing and curvature.
+    
+    Args:
+        h: (float) Current pole spacing near boundary
+        kappa: (float) Curvature magnitude
+        tol: (float) Tolerance for acceptable deviation
+    Returns: number of layers to insert
+    """
+    if kappa < 1e-12:  # avoid division by zero, or very small curvature
+        return 0
+    h_target = (tol / kappa) ** 0.5
+    layers = max(0, math.ceil(math.log2(h / h_target)))
+    return layers
+
+def can_apply_weighted_refinement(surface, alongV):
+    """
+    Check if surface can be refined using curvature-weighted method.
+    
+    Args:
+        surface: target BSpline surface
+        alongV: True if refining along V, False if U
+    Returns:
+        True if refinement can be applied, False otherwise
+    """
+    degree = surface.VDegree if alongV else surface.UDegree
+    poles_count = surface.NbVPoles if alongV else surface.NbUPoles
+    # Minimum degree and poles count for meaningful weighted refinement
+    if degree < 3 or poles_count < 4:
+        return False
+    return True
+
 def enforce_G1_multiple(target_face, drivers, collision_mode='average', refinement=None):
     """
     Enforce G1 continuity on target_face along multiple driver surfaces.
@@ -822,7 +1032,7 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
             'spread_rows': int,
             'falloff': float
         collision_mode: 'average' or 'directional_clamp'
-        refinement: dict with optional keys 'enabled', 'min_poles_u', 'min_poles_v', 'boundary_bias'
+        refinement: dict with optional keys
 
     Returns:
         True if all edges processed, False if some failed.
@@ -831,16 +1041,106 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
     if not isinstance(target_face.Surface, Part.BSplineSurface):
         raise RuntimeError("Target face is not a BSpline surface")
 
-    bs = None
-    if refinement is not None and refinement.get("enabled", False): # refinement requested, but not guaranteed
+    refine_surface = refinement is not None and refinement.get("method", None) is not None
+    bs = target_face.Surface.copy()
+    
+    refined = False # track if surface modified during preprocessing
+
+    if refine_surface and refinement.get("method", None) == "uniform":
         min_u = refinement.get("min_poles_u", 8)
         min_v = refinement.get("min_poles_v", 8)
-        boundary_bias = refinement.get("boundary_bias", 1.0)
         tol = refinement.get("tol", 1e-9)
+        degreeU, degreeV = bs.UDegree, bs.VDegree
+        nu, nv = bs.NbUPoles, bs.NbVPoles
+        # Ensure minimum degree 3 for better refinement
+        if degreeU < 3:
+            bs.increaseDegree(3, degreeV)  
+            refined = True          
+        if degreeV < 3:
+            bs.increaseDegree(degreeU, 3)
+            refined = True
 
-        bs = ensure_min_dof(target_face, drivers, min_u=min_u, min_v=min_v, boundary_bias=boundary_bias, tol=tol)
-    else:
-        bs = target_face.Surface
+        if nu < min_u:
+            refined |= insert_uniform_knots(bs, along_v=False, target_poles=min_u, tol=tol)
+        if nv < min_v:
+            refined |= insert_uniform_knots(bs, along_v=True, target_poles=min_v, tol=tol)
+
+    # Preprocess drivers
+    for drv in drivers:
+        driver_face = drv['driver_face']
+        samples = drv.get('samples', 30)
+        beta = drv.get('beta', 1.0)
+        spread_rows = drv.get('spread_rows', 4)
+        falloff = drv.get('falloff', 0.6)
+
+        # Find shared edge
+        edge = find_shared_edge(target_face, driver_face)
+        if edge is None:
+            App.Console.PrintWarning("Failed to find shared edge with driver face\n")
+            continue
+
+        drv['edge'] = edge
+
+        # Detect direction and boundary index 
+        along_v, boundary_index = detect_edge_direction_and_boundary(bs, edge)
+
+        if refine_surface:
+            needs_refinement = False # even if user requested, doesnt mean we need it
+
+            # check if weighted refinement is possible before degree elevation
+            # weighted_refinement inserts knots based on curvature, and if initial degree is too low, 
+            # it may not work well even after elevation -> curvature will stay the same
+            weighted_possible = can_apply_weighted_refinement(bs, along_v)
+
+            # check degree in refinement direction and if less than 3, elevate
+            # along_v indicates boundary direction, so refinement is perpendicular
+            degree = bs.VDegree if not along_v else bs.UDegree
+            if degree < 3:
+                if along_v:
+                    bs.increaseDegree(3, bs.VDegree)
+                else:
+                    bs.increaseDegree(bs.UDegree, 3)
+                refined = True
+
+            refinement_method = refinement.get("method", "uniform")                     
+            tol = refinement.get("tol", 1e-9)
+
+            # check curvature vs pole spacing
+            # each driver can modify the surface, so work on fresh copy of poles
+            poles = [[bs.getPole(i+1, j+1) for j in range(bs.NbVPoles)] for i in range(bs.NbUPoles)]
+            # Sample tangents from driver face along edge, do not interpolate yet
+            driver_tangents_dir = sample_driver_tangents(driver_face, edge, samples, None)
+
+            h = pole_spacing(poles, along_v, boundary_index)
+            curvatures = sample_boundary_curvature(driver_face.Surface, edge, driver_tangents_dir)
+            kappa = max(curvatures)
+
+            if kappa * h * h > 0.25:
+                needs_refinement = True
+
+            if needs_refinement:
+                
+
+                layers = max(refinement.get("layers", 0), estimate_refinement_layers(h, kappa, tol=0.25))
+
+                if layers == 0:
+                    App.Console.PrintWarning("Refinement needed but no layers estimated or provided\n")
+                    continue  # no refinement needed or possible
+
+                if refinement_method == "weighted" and weighted_possible:
+                    # compute weights based on driver tangents
+                    refined |= insert_curvature_weighted_knots(bs, not along_v, boundary_index, 
+                        edge, curvatures, layers, tol)
+                else:
+                    boundary_bias = refinement.get("boundary_bias", 1.2)                    
+                    refined |= insert_boundary_biased_knots(bs, not along_v, boundary_index, 
+                        layers, boundary_bias, tol)
+                    
+                                
+    # Debug: show modified surface after refinement
+    # if refined:
+    #     obj = App.ActiveDocument.addObject("Part::Feature", "ModifiedSurface")
+    #     obj.Shape = Part.Face(bs.copy())
 
     nu, nv = bs.NbUPoles, bs.NbVPoles
     is_rational = bs.isURational() or bs.isVRational()
@@ -919,9 +1219,12 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         beta = drv.get('beta', 1.0)
         spread_rows = drv.get('spread_rows', 4)
         falloff = drv.get('falloff', 0.6)
+        edge = drv['edge']
 
-        # Find shared edge
-        edge = find_shared_edge(target_face, driver_face)
+        if edge is None:
+            # Find shared edge
+            edge = find_shared_edge(target_face, driver_face)
+
         if edge is None:
             App.Console.PrintWarning("Failed to find shared edge with driver face\n")
             continue
@@ -1090,7 +1393,7 @@ drivers = []
 for f in driver_faces:
     drivers.append({
         'driver_face': f,   # tool face
-        'samples': 30,      # number of samples along edge
+        'samples': 30,      # (optional, default 30) number of samples along edge
         'beta': 1.0,        # blending factor (0.0 - 1.0). Higher = stronger driver influence.
         'spread_rows': 4,   # number of rows to spread corrections over. Higher = smoother transition, but spreading will not go past half the surface.
         'falloff': 0.6      # falloff factor for spreading (0.0 - 1.0). Lower = faster falloff.
@@ -1098,11 +1401,12 @@ for f in driver_faces:
 
 # Optional: refinement before G1 enforcement
 g1_refinement = {
-    "enabled": True,
-    "min_poles_u": 8,
-    "min_poles_v": 8,
-    "boundary_bias": 1.2,
-    "tol": 1e-9
+    "method": "weighted",   # "uniform", "biased", "weighted" (None to disable)
+    "min_poles_u": 8,       # (optional, default 8) for "uniform" method
+    "min_poles_v": 8,       # (optional, default 8) for "uniform" method
+    "boundary_bias": 1.2,   # for "biased" method
+    "layers": 3,            # (optional, will be estimated) number of knot insertion layers for "biased" and "weighted" methods (overrides automatic estimation)
+    "tol": 1e-9             # (optional, default 1e-9) knot insertion tolerance
 }
 
 #bs = enforce_G1_multiple(target_face, drivers, collision_mode='average') # more gentle corners blending
