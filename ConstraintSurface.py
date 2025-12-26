@@ -520,6 +520,17 @@ def lerp(v1, v2, t):
     v.normalize()
     return v
 
+def isRational(bs):
+    """
+    Check if BSpline surface is rational in either U or V direction.
+
+    Args:
+        bs: BSpline surface
+    Returns:
+        bool: True if rational in U or V
+    """
+    return bs.isURational() or bs.isVRational()
+
 def detect_edge_direction_and_boundary(bs, edge):
     """
     Detect if edge runs along U or V direction of the BSpline surface,
@@ -965,26 +976,44 @@ def get_spread_rows(boundary_index, spread_rows, nu, nv, along_v):
 
     return rows
 
-def pole_spacing(poles, along_v, boundary_index):
+def get_deweighted_pole(bs, i, j):
+    """
+    Get de-weighted pole from BSpline surface.
+    Args:
+        bs: (Part.BSplineSurface) target rational surface
+        i: pole index in U (0-based)
+        j: pole index in V (0-based)
+    """    
+    P = bs.getPole(i+1, j+1)
+    w = bs.getWeight(i+1, j+1)
+    if abs(w) < 1e-12:
+        return P
+    return P.multiply(1.0 / w)
+
+def pole_spacing(bs, along_v, boundary_index):
     """
     Gets pole spacing near boundary
     
     Args:
-    poles: surface poles as 2D list [nu][nv] of App.Vector
+    bs: (Part.BSplineSurface) target surface
     along_v: direction of boundary
     boundary_index: index of boundary row/column (0-based)
     """
-    step = 1 if boundary_index == 0 else -1
+    spacings = []
+    i0 = boundary_index
+    i1 = boundary_index + (1 if boundary_index == 0 else -1)   
     if along_v:
-        # spacing in V (rows)        
-        p0 = poles[boundary_index]
-        p1 = poles[boundary_index + step]
+        for j in range(bs.NbVPoles):
+            P0 = get_deweighted_pole(bs, i0, j)
+            P1 = get_deweighted_pole(bs, i1, j)
+            spacings.append(P1.sub(P0).Length)
     else:
-        p0 = [row[boundary_index] for row in poles]
-        p1 = [row[boundary_index + step] for row in poles]
+        for i in range(bs.NbUPoles):
+            P0 = get_deweighted_pole(bs, i, i0)
+            P1 = get_deweighted_pole(bs, i, i1)
+            spacings.append(P1.sub(P0).Length)
 
-    spacings = [(p1[i].sub(p0[i])).Length for i in range(len(p0))]
-    return sum(spacings) / len(spacings)
+    return sum(spacings) / max(len(spacings), 1)
 
 def estimate_refinement_layers(h, kappa, tol=0.25):
     """
@@ -1106,12 +1135,11 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
             tol = refinement.get("tol", 1e-9)
 
             # check curvature vs pole spacing
-            # each driver can modify the surface, so work on fresh copy of poles
-            poles = [[bs.getPole(i+1, j+1) for j in range(bs.NbVPoles)] for i in range(bs.NbUPoles)]
+
             # Sample tangents from driver face along edge, do not interpolate yet
             driver_tangents_dir = sample_driver_tangents(driver_face, edge, samples, None)
 
-            h = pole_spacing(poles, along_v, boundary_index)
+            h = pole_spacing(bs, along_v, boundary_index)
             curvatures = sample_boundary_curvature(driver_face.Surface, edge, driver_tangents_dir)
             kappa = max(curvatures)
 
@@ -1135,15 +1163,14 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
                     boundary_bias = refinement.get("boundary_bias", 1.2)                    
                     refined |= insert_boundary_biased_knots(bs, not along_v, boundary_index, 
                         layers, boundary_bias, tol)
-                    
-                                
+                              
     # Debug: show modified surface after refinement
     # if refined:
     #     obj = App.ActiveDocument.addObject("Part::Feature", "ModifiedSurface")
     #     obj.Shape = Part.Face(bs.copy())
 
     nu, nv = bs.NbUPoles, bs.NbVPoles
-    is_rational = bs.isURational() or bs.isVRational()
+    is_rational = isRational(bs)
 
     # Save original poles and weights
     orig_poles = [[bs.getPole(i+1, j+1) for j in range(nv)] for i in range(nu)]
