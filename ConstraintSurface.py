@@ -106,6 +106,14 @@ def show_surface(bs, name="DebugSurface", color=None):
 
 #### Core functionality ###
 
+class FairingDriver:
+    def __init__(self, axis, side, max_dist, strength, decay):
+        self.axis = axis
+        self.side = side
+        self.max_dist = max_dist
+        self.strength = strength
+        self.decay = decay
+
 def insert_uniform_knots(bs, along_v, target_poles=8, tol=1e-9):
     """
     Insert uniform knots into a BSplineSurface to reach at least target pole count.
@@ -1044,7 +1052,7 @@ def can_apply_weighted_refinement(surface, alongV):
         return False
     return True
 
-def resolve_constraints(desired_dirs, angle_tol=15.0 * 3.14159265 / 180.0):
+def resolve_constraints(desired_dirs):
     """
     Build per-pole motion constraints from desired directions.
 
@@ -1255,116 +1263,77 @@ def compute_distance_to_fixed(nu, nv, fixed):
                     q.append((ni,nj))
     return dist
 
-def fair_surface(poles, moved, strength=0.5, iters=2):
-    nu, nv = len(poles), len(poles[0])
-    poles = [[App.Vector(poles[i][j]) for j in range(nv)] for i in range(nu)]
-
-    for _ in range(iters):
-        newp = [[App.Vector(poles[i][j]) for j in range(nv)] for i in range(nu)]
-
-        for i in range(1, nu-1):
-            for j in range(1, nv-1):
-                if moved.get((i, j), False):
-                    continue  # anchors stay fixed
-
-                avg = (
-                    poles[i+1][j] +
-                    poles[i-1][j] +
-                    poles[i][j+1] +
-                    poles[i][j-1]
-                ).multiply(0.25)
-
-                newp[i][j] = poles[i][j].add(
-                    avg.sub(poles[i][j]).multiply(strength)
-                )
-
-        poles = newp
-
-    return poles
-
-def fair_surface_curvature(poles, moved, fixed, strength=0.5, iters=5, alpha=2.0):
+def fair_surface(poles, drivers, fixed_poles, g1_poles, dist, add_delta):
     nu = len(poles)
     nv = len(poles[0])
 
-    print(f"Total poles moved for G1 enforcement: {len(moved)}\n {moved.keys()}")
+    for driver in drivers:
+        axis = driver.axis        # 'U' or 'V'
+        side = driver.side        # +1 or -1
+        max_dist = driver.max_dist
+        strength = driver.strength
+        decay = driver.decay
 
-    poles = [[App.Vector(poles[i][j]) for j in range(nv)] for i in range(nu)]
+        for i in range(nu):
+            for j in range(nv):
 
-    dist = compute_distance_to_fixed(nu, nv, fixed)
+                idx = (i, j)
 
-    print("Distance field:")
-    for j in range(nv):
-        print([dist[i][j] for i in range(nu)])
-    
-    max_dist = int(0.6 * max(dist[i][j] for i in range(nu) for j in range(nv)))
-
-    for _ in range(iters):
-        new_poles = [[App.Vector(poles[i][j]) for j in range(nv)] for i in range(nu)]
-
-        for i in range(1, nu-1):
-            for j in range(1, nv-1):
-                # skip G1 row poles
-                if moved.get((i, j), False) or (i, j) in fixed:
+                # do not modify fixed or G1 poles
+                if idx in fixed_poles:
                     continue
-
-                d = dist[i][j]
-                if d > max_dist:
+                if idx in g1_poles:
                     continue
-
-                P = poles[i][j]
-
-                # neighbors
-                Pu1, Pu0 = poles[i+1][j], poles[i-1][j]
-                Pv1, Pv0 = poles[i][j+1], poles[i][j-1]
-
-                # tangents
-                Tu = Pu1.sub(Pu0)
-                Tv = Pv1.sub(Pv0)
-                if Tu.Length < 1e-9 or Tv.Length < 1e-9:
-                    continue
-
-                Tu.normalize()
-                Tv.normalize()
-
-                N = Tu.cross(Tv)
-                if N.Length < 1e-9:
-                    continue
-                N.normalize()
-
-                # Laplacian
-                avg = (Pu1 + Pu0 + Pv1 + Pv0).multiply(0.25)
-                delta = avg.sub(P)
-
-                # curvature proxy
-                Cu = Pu1.sub(App.Vector(P).multiply(2)).add(Pu0)
-                Cv = Pv1.sub(App.Vector(P).multiply(2)).add(Pv0)
-                kappa = Cu.Length + Cv.Length
-
-                # Curvature damping
-                w = 1.0 / (1.0 + alpha * kappa)
-                delta = delta.multiply(w * strength)
-
-                # Normal allowance ramp
-                dn = App.Vector(N).multiply(delta.dot(N))
-                dt = delta.sub(dn)
-
-                if d <= 2:
-                    normal_weight = 0.0
-                elif d == 3:
-                    normal_weight = 0.25
-                elif d == 4:
-                    normal_weight = 0.5
-                else:
-                    normal_weight = 1.0
-
-                delta = dt.add(dn.multiply(normal_weight))
                 
-                new_poles[i][j] = P.add(delta)
+                # do not modify poles beyond max distance
+                d = dist[i][j]
+                if d <= 0 or d > max_dist:
+                    continue
 
-        poles = new_poles
+                # directional neighbors
+                if axis == 'U':
+                    # driver along U → fair in V
+                    jp = j + side
+                    jm = j - side
+                    if jp < 0 or jp >= nv or jm < 0 or jm >= nv:
+                        continue
 
-    return poles
+                    P  = poles[i][j]
+                    Pp = poles[i][jp]
+                    Pm = poles[i][jm]
+                else:
+                    # driver along V → fair in U
+                    ip = i + side
+                    im = i - side
+                    if ip < 0 or ip >= nu or im < 0 or im >= nu:
+                        continue
 
+                    P  = poles[i][j]
+                    Pp = poles[ip][j]
+                    Pm = poles[im][j]
+
+                # 1D Laplacian
+                lap = (Pp + Pm) * 0.5 - P
+
+                # distance-weighted decay
+                w = decay(d)
+                if w <= 0.0:
+                    continue
+
+                delta = lap * (strength * w)
+
+                add_delta(i, j, delta)
+
+def linear_decay(d, max_d):
+    return max(0.0, 1.0 - d / max_d)
+
+def smooth_decay(d, max_d):
+    t = min(1.0, d / max_d)
+    return 1.0 - (3*t*t - 2*t*t*t)
+
+def gaussian_decay(d, sigma):
+    return math.exp(-(d*d) / (2*sigma*sigma))
+              
 def v_avg(vecs):
         v = App.Vector(0,0,0)
         for vec in vecs:
@@ -1402,7 +1371,8 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
     refine_surface = refinement is not None and refinement.get("method", None) is not None
     bs = target_face.Surface.copy()
     
-    refined = False # track if surface modified during preprocessing - for debugging
+    # track if surface modified during preprocessing - for debugging
+    refined = False 
 
     # for uniform refinement we do it independent of drivers
     if refine_surface and refinement.get("method", None) == "uniform":
@@ -1501,16 +1471,15 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
     if is_rational:
         orig_weights = [[bs.getWeight(i+1, j+1) for j in range(nv)] for i in range(nu)]
 
-    # Initialize accumulators for pole deltas and weights
-    delta_parallel = [[None for _ in range(nv)] for _ in range(nu)] # Store parallel deltas, keep strongest
-    delta_orthogonal = [[[] for _ in range(nv)] for _ in range(nu)] # Store orthogonal deltas
-    delta_avg = [[[] for _ in range(nv)] for _ in range(nu)] # Store full deltas
-
-    # acumulate weights if rational
-    weights = None
-    if is_rational:
-        weights = [[[] for _ in range(nv)] for _ in range(nu)]
-
+    # Accumulators for pole deltas
+    # (i, j): {
+    #     "parallel": None,          # strongest projected delta
+    #     "orthogonal": [],          # list of residual deltas
+    #     "fairing": [],             # fairing-only deltas
+    #     "raw": [],                 # raw deltas for debugging or averaging
+    #     "weights": []              # rational only
+    # }
+    delta_accum = {}
     # Desired transverse directions per boundary pole (before spreading)
     # key = (u,v) - pole indices
     desired_dirs = defaultdict(list)
@@ -1591,10 +1560,6 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         if delta.Length < 1e-9:
             return
         
-        delta_avg[i][j].append(delta)
-        if is_rational and weight is not None:
-            weights[i][j].append(weight)
-
         # apply pole constraint
         constraint = pole_constraints.get((i, j))
         if constraint:
@@ -1602,11 +1567,27 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
             if delta.Length < 1e-9:
                 return
 
+        key = (i, j)
+        if key not in delta_accum:
+            delta_accum[key] = {
+                "parallel": None,
+                "orthogonal": [],
+                "fairing": [],
+                "raw": [],
+                "weights": []
+            }
+
+        acc = delta_accum[key]
+        acc["raw"].append(App.Vector(delta))
+
+        if is_rational and weight is not None:
+            acc["weights"].append(weight)
+
         basis = pole_basis[i][j]
 
         # no basis: pure accumulation
         if not basis:
-            delta_orthogonal[i][j].append(delta)
+            acc["orthogonal"].append(delta)
             return
         
         # Delta decomposition
@@ -1619,13 +1600,13 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         d_orth = delta.sub(d_proj)
 
         # parallel: keep strongest projection
-        cur = delta_parallel[i][j]
+        cur = acc["parallel"]
         if cur is None or d_proj.Length > cur.Length:
-            delta_parallel[i][j] = d_proj
+            acc["parallel"] = d_proj
 
         # orthogonal: store residuals
         if d_orth.Length > 1e-9:
-            delta_orthogonal[i][j].append(d_orth)
+            acc["orthogonal"].append(d_orth)
 
     # fixed poles set (boundary poles)
     fixed = set()
@@ -1641,79 +1622,119 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         i, j = intent["pole"]
 
         delta = App.Vector(intent["delta"])
-
-        # if intent["along_v"]:
-        #     for v in range(nv):
-        #         fixed.add((intent["boundary"], v))
-        # else:
-        #     for u in range(nu):
-        #         fixed.add((u, intent["boundary"]))
-
         if is_rational:
             add_delta(i, j, delta, orig_weights[i][j])
         else:
             add_delta(i, j, delta)
 
-    print(f"Fixed (boundary) poles: {len(fixed)} \n {fixed}")
+    # Track moved (G1) poles for fairing, exclude boundaries
+    # set of (i,j)
+    moved = set()    
+    for (i, j), acc in delta_accum.items():
+        if acc["parallel"] or (acc["orthogonal"] and len(acc["orthogonal"]) > 0):
+            moved.add((i, j))
 
-    # Track moved poles for fairing
-    # moved = [[False]*nv for _ in range(nu)]
-    # key: (i,j), value: True
-    moved = {}
+    def add_fairing_delta(i, j, delta, weight=1.0):
+        if delta.Length < 1e-9:
+            return
 
-    for i in range(nu):
-        for j in range(nv):
-            if delta_parallel[i][j] or len(delta_orthogonal[i][j]) > 0:
-                moved[(i, j)] = True
+        # never move fixed / constrained poles
+        if (i, j) in fixed or (i, j) in moved:
+            return
 
+        key = (i, j)
+        if key not in delta_accum:
+            delta_accum[key] = {
+                "parallel": None,
+                "orthogonal": [],
+                "fairing": [],
+                "raw": [],
+                "weights": []
+            }
 
+        # fairing is always orthogonal to constraints
+        delta_accum[key]["fairing"].append(delta.multiply(weight))
 
     # Apply accumulated deltas to adjacent row poles solving conflicts
     # Compute final poles by averaging deltas
     if collision_mode == 'average':
-        for i in range(nu):
-            for j in range(nv):
-                if moved.get((i, j), False) and len(delta_avg[i][j]) > 0:
-                    new_pole = orig_poles[i][j].add(v_avg(delta_avg[i][j]))
-                    bs.setPole(i + 1, j + 1, new_pole)
-                    if is_rational:
-                        avg_weight = orig_weights[i][j]
-                        if weights and len(weights[i][j]) > 0:
-                            avg_weight = w_avg(weights[i][j])
-                        bs.setWeight(i + 1, j + 1, avg_weight)
+        for (i, j), acc in delta_accum.items():
+            new_pole = orig_poles[i][j].add(v_avg(acc["raw"]))
+            bs.setPole(i + 1, j + 1, new_pole)
+
+            if is_rational:
+                avg_weight = orig_weights[i][j]
+                if acc["weights"] and len(acc["weights"]) > 0:
+                    avg_weight = w_avg(acc["weights"])
+                bs.setWeight(i + 1, j + 1, avg_weight)
     # Compute final poles by derectionaly averaging deltas
     elif collision_mode == 'directional_clamp':
-        for i in range(nu):
-            for j in range(nv):
-                if moved.get((i, j), False):
-                    d = App.Vector(0,0,0)
+        for (i, j), acc in delta_accum.items():
+            d = App.Vector(0, 0, 0)
 
-                    if delta_parallel[i][j]:
-                        d = d.add(delta_parallel[i][j])
+            if acc["parallel"]:
+                d = d.add(acc["parallel"])
 
-                    if len(delta_orthogonal[i][j]) > 0:
-                        d = d.add(v_avg(delta_orthogonal[i][j]))
+            if acc["orthogonal"] and len(acc["orthogonal"]) > 0:
+                d = d.add(v_avg(acc["orthogonal"]))
 
-                    if d.Length > 1e-9:
-                        new_pole = orig_poles[i][j].add(d)
-                        bs.setPole(i + 1, j + 1, new_pole)
+            if d.Length < 1e-9:
+                continue
 
-                        if is_rational:
-                            avg_weight = orig_weights[i][j]
-                            if weights and len(weights[i][j]) > 0:
-                                avg_weight = w_avg(weights[i][j])
-                            bs.setWeight(i + 1, j + 1, avg_weight)
+            bs.setPole(i + 1, j + 1, orig_poles[i][j].add(d))
+
+            if is_rational:
+                avg_weight = orig_weights[i][j]
+                if acc["weights"] and len(acc["weights"]) > 0:
+                    avg_weight = w_avg(acc["weights"])
+                bs.setWeight(i + 1, j + 1, avg_weight)
     
-    poles = [[bs.getPole(i+1, j+1) for j in range(nv)] for i in range(nu)]
+    # show_surface(bs, "G1_Enforced_Surface_Raw")
 
-    show_surface(bs, "G1_Enforced_Surface_Raw")
+    # Compute distance field from fixed poles (boundary and constrained)
+    dist = compute_distance_to_fixed(nu, nv, moved)
+    print("Distance field:")
+    for j in range(nv):
+        print([dist[i][j] for i in range(nu)])
 
-    # poles = fair_surface(poles, moved, strength=0.4, iters=3)#spread_rows)
-    poles = fair_surface_curvature(poles, moved, fixed, strength=0.5, iters=5, alpha=2.0)
-    for i in range(nu):
-        for j in range(nv):
-            bs.setPole(i+1, j+1, poles[i][j])   
+    # gather fairing drivers
+    drivers_fairing = []
+    for drv in drivers:
+        along_v = drv.get('along_v', True)
+        boundary_index = drv.get('boundary_index', 0)
+        spread = int(0.8 * max([d for rows in dist for d in rows]))
+        strength = drv.get('fairing_strength', 0.8)
 
+        axis = 'U' if along_v else 'V'
+        side = 1 if boundary_index == 0 else -1
+
+        driver = FairingDriver(
+            axis=axis,
+            side=side,
+            max_dist=spread,
+            strength=strength,
+            decay=lambda d, md=spread: smooth_decay(d, md)
+        )
+
+        drivers_fairing.append(driver)
+
+    # Run fairing multiple times for better effect
+    for _ in range(3):    
+        poles = [[bs.getPole(i+1, j+1) for j in range(nv)] for i in range(nu)]
+
+        fair_surface(poles, drivers_fairing, fixed, moved, dist, add_delta=add_fairing_delta)
+
+        # apply fairing deltas, just an average
+        for (i, j), acc in delta_accum.items():
+            d = App.Vector(0, 0, 0)
+            # --- fairing (soft, damped) ---
+            if acc["fairing"] and len(acc["fairing"]) > 0:
+                d = d.add(v_avg(acc["fairing"]))
+
+            if d.Length < 1e-9:
+                continue
+
+            bs.setPole(i + 1, j + 1, orig_poles[i][j].add(d))
     return bs
 
 def getSelectedFaces():
