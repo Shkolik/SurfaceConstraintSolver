@@ -1263,6 +1263,12 @@ def compute_distance_to_fixed(nu, nv, fixed):
                     q.append((ni,nj))
     return dist
 
+def extract_g1_indices(locked_poles, axis):
+    idx = set()
+    for (i, j) in locked_poles.keys():
+        idx.add(i if axis == 'U' else j)
+    return idx
+
 def fair_surface(poles, drivers, fixed_poles, g1_poles, dist, add_delta):
     nu = len(poles)
     nv = len(poles[0])
@@ -1323,6 +1329,35 @@ def fair_surface(poles, drivers, fixed_poles, g1_poles, dist, add_delta):
                 delta = lap * (strength * w)
 
                 add_delta(i, j, delta)
+
+def propagate_g1_fairing(g1_intents, drivers, nu, nv, add_delta):
+    for drv in drivers:
+        axis = drv.axis
+        max_dist = drv.max_dist
+        decay = drv.decay
+        side = drv.side
+
+        for intent in g1_intents:
+            i0, j0 = intent['pole']
+            delta0 = intent['delta']
+
+            for d in range(1, max_dist + 1):
+                w = decay(d)
+                if w < 1e-6:
+                    continue
+
+                if axis == 'U':
+                    i = i0 + d * side
+                    j = j0
+                else:
+                    i = i0
+                    j = j0 + d * side
+
+                # stay within interior poles only
+                if not (1 <= i < nu-1 and 1 <= j < nv-1):
+                    break
+
+                add_delta(i, j, delta0, w, d)
 
 def linear_decay(d, max_d):
     return max(0.0, 1.0 - d / max_d)
@@ -1405,10 +1440,13 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
             App.Console.PrintWarning("Failed to find shared edge with driver face\n")
             continue
 
-        drv['edge'] = edge
-
         # Detect direction and boundary index 
         along_v, boundary_index = detect_edge_direction_and_boundary(bs, edge)
+
+        drv['edge'] = edge
+        drv['along_v'] = along_v
+        drv['side'] = 1 if boundary_index == 0 else -1
+        drv['axis'] = 'U' if along_v else 'V'
 
         if refine_surface:
             needs_refinement = False # even if user requested, doesnt mean we need it
@@ -1634,7 +1672,7 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         if acc["parallel"] or (acc["orthogonal"] and len(acc["orthogonal"]) > 0):
             moved.add((i, j))
 
-    def add_fairing_delta(i, j, delta, weight=1.0):
+    def add_fairing_delta(i, j, delta, weight=1.0, d = 0):
         if delta.Length < 1e-9:
             return
 
@@ -1652,10 +1690,14 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
                 "weights": []
             }
 
+        # print(f"Applying propagated fairing delta to pole({i}, {j}) with magnitude {delta.Length}; decay weight {weight}; distance {d}")
+               
+
         # fairing is always orthogonal to constraints
-        delta_accum[key]["fairing"].append(delta.multiply(weight))
+        delta_accum[key]["fairing"].append(App.Vector(delta).multiply(weight))
 
     # Apply accumulated deltas to adjacent row poles solving conflicts
+
     # Compute final poles by averaging deltas
     if collision_mode == 'average':
         for (i, j), acc in delta_accum.items():
@@ -1693,20 +1735,17 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
 
     # Compute distance field from fixed poles (boundary and constrained)
     dist = compute_distance_to_fixed(nu, nv, moved)
-    print("Distance field:")
-    for j in range(nv):
-        print([dist[i][j] for i in range(nu)])
+    # print("Distance field:")
+    # for j in range(nv):
+    #     print([dist[i][j] for i in range(nu)])
 
     # gather fairing drivers
     drivers_fairing = []
     for drv in drivers:
-        along_v = drv.get('along_v', True)
-        boundary_index = drv.get('boundary_index', 0)
-        spread = int(0.8 * max([d for rows in dist for d in rows]))
+        axis = drv.get('axis', 'U')
+        side = drv.get('side', 1)
+        spread = int(1.0 * max([d for rows in dist for d in rows]))
         strength = drv.get('fairing_strength', 0.8)
-
-        axis = 'U' if along_v else 'V'
-        side = 1 if boundary_index == 0 else -1
 
         driver = FairingDriver(
             axis=axis,
@@ -1718,23 +1757,39 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
 
         drivers_fairing.append(driver)
 
+    propagate_g1_fairing(g1_intents, drivers_fairing, nu, nv, add_fairing_delta)
+    # deltas = []
+    for (i, j), acc in delta_accum.items():
+        d = App.Vector(0, 0, 0)
+        if acc["fairing"] and len(acc["fairing"]) > 0:
+            d = d.add(v_avg(acc["fairing"]))
+
+        if d.Length < 1e-9:
+            continue
+        # deltas.append(orig_poles[i][j].add(d))
+        bs.setPole(i + 1, j + 1, orig_poles[i][j].add(d))
+    
+    # draw_points(deltas, (1.0, 0.0, 1.0), 0.2, "Faired_Poles")
+
+    # Laplacian based fairing - save for now just in case
+
     # Run fairing multiple times for better effect
-    for _ in range(3):    
-        poles = [[bs.getPole(i+1, j+1) for j in range(nv)] for i in range(nu)]
+    # for _ in range(3):    
+    #     poles = [[bs.getPole(i+1, j+1) for j in range(nv)] for i in range(nu)]
 
-        fair_surface(poles, drivers_fairing, fixed, moved, dist, add_delta=add_fairing_delta)
+    #     fair_surface(poles, drivers_fairing, fixed, moved, dist, add_delta=add_fairing_delta)
 
-        # apply fairing deltas, just an average
-        for (i, j), acc in delta_accum.items():
-            d = App.Vector(0, 0, 0)
-            # --- fairing (soft, damped) ---
-            if acc["fairing"] and len(acc["fairing"]) > 0:
-                d = d.add(v_avg(acc["fairing"]))
+    #     # apply fairing deltas, just an average
+    #     for (i, j), acc in delta_accum.items():
+    #         d = App.Vector(0, 0, 0)
+    #         # --- fairing (soft, damped) ---
+    #         if acc["fairing"] and len(acc["fairing"]) > 0:
+    #             d = d.add(v_avg(acc["fairing"]))
 
-            if d.Length < 1e-9:
-                continue
+    #         if d.Length < 1e-9:
+    #             continue
 
-            bs.setPole(i + 1, j + 1, orig_poles[i][j].add(d))
+    #         bs.setPole(i + 1, j + 1, orig_poles[i][j].add(d))
     return bs
 
 def getSelectedFaces():
@@ -1763,9 +1818,7 @@ for f in driver_faces:
     drivers.append({
         'driver_face': f,   # tool face
         'samples': 30,      # (optional, default 30) number of samples along edge
-        'beta': 1.0,        # blending factor (0.0 - 1.0). Higher = stronger driver influence.
-        'spread_rows': 4,   # number of rows to spread corrections over. Higher = smoother transition, but spreading will not go past half the surface.
-        'falloff': 0.6      # falloff factor for spreading (0.0 - 1.0). Lower = faster falloff.
+        'beta': 1.0,        # blending factor (0.0 - 1.0). Higher = stronger driver influence.        
     })
 
 # Optional: refinement before G1 enforcement
