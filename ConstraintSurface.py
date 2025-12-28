@@ -545,6 +545,18 @@ def lerp(v1, v2, t):
 
     v.normalize()
     return v
+              
+def v_avg(vecs):
+        v = App.Vector(0,0,0)
+        for vec in vecs:
+            v = v.add(vec)
+        return v.multiply(1.0 / len(vecs))
+    
+def w_avg(ws):
+    d = 0.0
+    for w in ws:
+        d += w
+    return d / len(ws)
 
 def isRational(bs):
     """
@@ -902,7 +914,6 @@ def compute_g1_row(orig_poles, driver_tangents_dir, along_v, boundary_index, bet
     adj_row = boundary_index + step
     
     for j in range(row_len):
-
         if along_v:
             P1 = orig_poles[boundary_index][j]
             P2 = orig_poles[adj_row][j]
@@ -942,41 +953,24 @@ def compute_g1_row(orig_poles, driver_tangents_dir, along_v, boundary_index, bet
 
     return g1_row
 
-def get_spread_rows(boundary_index, spread_rows, nu, nv, along_v):
+def get_spread_rows(g1_idx, spread_rows, step):
     """
     Find interior rows to apply G1 spreading.
 
     Args:
-        boundary_index: index of boundary row/column (0-based)
+        g1_idx: index of boundary g1 row (0-based)
         spread_rows: requested number of interior rows
-        nu, nv: number of poles in U and V
-        along_v: True if boundary is U=const, False if V=const
+        step: direction step (1 or -1)
 
     Returns:
         list of row indices (0-based), ordered from edge inward
     """
 
-    num_rows = nu if along_v else nv
-
-    max_safe = max(1, num_rows // 2)
-    spread = max(1, min(spread_rows, max_safe))
-
-    # Determine direction
-    if boundary_index == 0:
-        step = 1
-        r = 1
-    else:
-        step = -1
-        r = boundary_index - 1
-
-    # Collect rows
+    r1 = g1_idx + step
     rows = []
-
-    for _ in range(spread):
-        if not (0 <= r < num_rows):
-            break
-        rows.append(r)
-        r += step
+    for _ in range(spread_rows):
+        rows.append(r1)
+        r1 += step        
 
     return rows
 
@@ -1063,7 +1057,8 @@ def resolve_constraints(desired_dirs):
                 "mag": float,
                 "along_v": bool,
                 "boundary": int,
-                "driver_idx": int
+                "driver_idx": int,
+                "priority": int
             }
 
     Returns:
@@ -1074,55 +1069,83 @@ def resolve_constraints(desired_dirs):
 
     for key, entries in desired_dirs.items():
 
-        # --- sanitize ---
+        if not entries:
+            continue
+
+        # Priority filtering
+        hard = [e for e in entries if e["priority"] == 0]
+
+        if hard:
+            active = hard
+        else:
+            active = entries
+
+        if not active:
+            continue
+
+
+        # sanitize
         dirs = []
         mags = []
+        priorities = []
 
-        for e in entries:
+        for e in active:
             d = App.Vector(e["dir"])
             if d.Length < 1e-9:
                 continue
             d.normalize()
             dirs.append(d)
             mags.append(abs(e["mag"]))
+            priorities.append(e["priority"])
 
         if not dirs:
             continue
 
-        # --- single driver: trivial ---
+        # Single driver
         if len(dirs) == 1:
             pole_constraints[key] = {
                 "mode": "single",
                 "dir": dirs[0],
-                "max_mag": mags[0]
+                "max_mag": mags[0],
+                "priority": priorities[0]
             }
             continue
 
-        # --- cluster directions by alignment ---
-        clusters = []  # list of {"dir": vec, "mags": [], "dirs": []}
+        # Cluster directions by alignment
+        clusters = []  # list of {"dir": vec, "mags": [], "dirs": [], "priorities": []}
 
-        for d, m in zip(dirs, mags):
+        for d, m, p in zip(dirs, mags, priorities):
             placed = False
             for c in clusters:
                 if abs(c["dir"].dot(d)) > 1.0 - 1e-6:
                     c["mags"].append(m)
                     c["dirs"].append(d)
+                    c["priorities"].append(p)
                     placed = True
                     break
             if not placed:
                 clusters.append({
                     "dir": App.Vector(d),
                     "dirs": [d],
-                    "mags": [m]
+                    "mags": [m],
+                    "priorities": [p]
                 })
 
+        def cluster_max_mag_priority(c):
+            max_mag = max(c["mags"])            
+            for m, p in zip(c["mags"], c["priorities"]):
+                if m == max_mag:
+                    return p
+            return min(c["priorities"])
+        
         # --- one dominant cluster ---
         if len(clusters) == 1:
             c = clusters[0]
             pole_constraints[key] = {
                 "mode": "single",
                 "dir": c["dir"],
-                "max_mag": max(c["mags"])
+                "max_mag": max(c["mags"]),
+                "priority": min(c["priorities"])
             }
             continue
 
@@ -1147,23 +1170,22 @@ def resolve_constraints(desired_dirs):
             u = App.Vector(c1["dir"])
             u.normalize()
             v = App.Vector(c2["dir"])
-            v = v.sub(u.multiply(v.dot(u)))
+            v = v.sub(App.Vector(u).multiply(v.dot(u)))
             if v.Length > 1e-9:
                 v.normalize()
 
                 pole_constraints[key] = {
                     "mode": "plane",
                     "basis": [u, v],
-                    "max_mag": min(max(c1["mags"]), max(c2["mags"]))
+                    "max_mag": min(max(c1["mags"]), max(c2["mags"])),
+                    "priority": min(min(c1["priorities"]), min(c2["priorities"]))
                 }
                 continue
 
         # --- fallback: clamp ---
         # Multiple conflicting directions, low DOF
-        # Allow movement but cap magnitude
-        avg_dir = App.Vector(0, 0, 0)
-        for d in dirs:
-            avg_dir = avg_dir.add(d)
+        # Allow movement but cap magnitude and priority
+        avg_dir = v_avg(dirs)
 
         if avg_dir.Length > 1e-9:
             avg_dir.normalize()
@@ -1171,36 +1193,45 @@ def resolve_constraints(desired_dirs):
         pole_constraints[key] = {
             "mode": "clamp",
             "dir": avg_dir,
-            "max_mag": min(mags)
+            "max_mag": min(mags),
+            "priority": min(priorities)
         }
 
     return pole_constraints
+
+def effective_max_mag(c):
+    if c["priority"] <= 0:
+        return c["max_mag"]
+    return c["max_mag"] * (1.0 / (0.3 + c["priority"]))
+
 
 def apply_constraint(delta, c):
     if delta.Length < 1e-9:
         return delta
 
+    max_mag = effective_max_mag(c)
+
     if c["mode"] == "single":
         d = App.Vector(c["dir"])
         mag = delta.dot(d)
-        mag = max(-c["max_mag"], min(c["max_mag"], mag))
+        mag = max(-max_mag, min(max_mag, mag))
         return d.multiply(mag)
 
     if c["mode"] == "plane":
         proj = App.Vector(0, 0, 0)
         for b in c["basis"]:
-            proj = proj.add(b.multiply(delta.dot(b)))
+            proj = proj.add(App.Vector(b).multiply(delta.dot(b)))
 
-        if proj.Length > c["max_mag"]:
+        if proj.Length > max_mag:
             proj.normalize()
-            proj = proj.multiply(c["max_mag"])
+            proj = proj.multiply(max_mag)
         return proj
 
     if c["mode"] == "clamp":
-        if delta.Length > c["max_mag"]:
+        if delta.Length > max_mag:
             delta = App.Vector(delta)
             delta.normalize()
-            delta = delta.multiply(c["max_mag"])
+            delta = delta.multiply(max_mag)
         return delta
 
     return delta
@@ -1243,122 +1274,6 @@ def build_pole_basis(bs):
 
     return basis
 
-def compute_distance_to_fixed(nu, nv, fixed):
-    dist = [[1e9]*nv for _ in range(nu)]
-
-    from collections import deque
-    q = deque()
-
-    for (i,j) in fixed:
-        dist[i][j] = 0
-        q.append((i,j))
-
-    while q:
-        i,j = q.popleft()
-        for di,dj in ((1,0),(-1,0),(0,1),(0,-1)):
-            ni,nj = i+di, j+dj
-            if 0 <= ni < nu and 0 <= nj < nv:
-                if dist[ni][nj] > dist[i][j] + 1:
-                    dist[ni][nj] = dist[i][j] + 1
-                    q.append((ni,nj))
-    return dist
-
-def extract_g1_indices(locked_poles, axis):
-    idx = set()
-    for (i, j) in locked_poles.keys():
-        idx.add(i if axis == 'U' else j)
-    return idx
-
-def fair_surface(poles, drivers, fixed_poles, g1_poles, dist, add_delta):
-    nu = len(poles)
-    nv = len(poles[0])
-
-    for driver in drivers:
-        axis = driver.axis        # 'U' or 'V'
-        side = driver.side        # +1 or -1
-        max_dist = driver.max_dist
-        strength = driver.strength
-        decay = driver.decay
-
-        for i in range(nu):
-            for j in range(nv):
-
-                idx = (i, j)
-
-                # do not modify fixed or G1 poles
-                if idx in fixed_poles:
-                    continue
-                if idx in g1_poles:
-                    continue
-                
-                # do not modify poles beyond max distance
-                d = dist[i][j]
-                if d <= 0 or d > max_dist:
-                    continue
-
-                # directional neighbors
-                if axis == 'U':
-                    # driver along U → fair in V
-                    jp = j + side
-                    jm = j - side
-                    if jp < 0 or jp >= nv or jm < 0 or jm >= nv:
-                        continue
-
-                    P  = poles[i][j]
-                    Pp = poles[i][jp]
-                    Pm = poles[i][jm]
-                else:
-                    # driver along V → fair in U
-                    ip = i + side
-                    im = i - side
-                    if ip < 0 or ip >= nu or im < 0 or im >= nu:
-                        continue
-
-                    P  = poles[i][j]
-                    Pp = poles[ip][j]
-                    Pm = poles[im][j]
-
-                # 1D Laplacian
-                lap = (Pp + Pm) * 0.5 - P
-
-                # distance-weighted decay
-                w = decay(d)
-                if w <= 0.0:
-                    continue
-
-                delta = lap * (strength * w)
-
-                add_delta(i, j, delta)
-
-def propagate_g1_fairing(g1_intents, drivers, nu, nv, add_delta):
-    for drv in drivers:
-        axis = drv.axis
-        max_dist = drv.max_dist
-        decay = drv.decay
-        side = drv.side
-
-        for intent in g1_intents:
-            i0, j0 = intent['pole']
-            delta0 = intent['delta']
-
-            for d in range(1, max_dist + 1):
-                w = decay(d)
-                if w < 1e-6:
-                    continue
-
-                if axis == 'U':
-                    i = i0 + d * side
-                    j = j0
-                else:
-                    i = i0
-                    j = j0 + d * side
-
-                # stay within interior poles only
-                if not (1 <= i < nu-1 and 1 <= j < nv-1):
-                    break
-
-                add_delta(i, j, delta0, w, d)
-
 def linear_decay(d, max_d):
     return max(0.0, 1.0 - d / max_d)
 
@@ -1368,18 +1283,6 @@ def smooth_decay(d, max_d):
 
 def gaussian_decay(d, sigma):
     return math.exp(-(d*d) / (2*sigma*sigma))
-              
-def v_avg(vecs):
-        v = App.Vector(0,0,0)
-        for vec in vecs:
-            v = v.add(vec)
-        return v.multiply(1.0 / len(vecs))
-    
-def w_avg(ws):
-    d = 0.0
-    for w in ws:
-        d += w
-    return d / len(ws)
 
 def enforce_G1_multiple(target_face, drivers, collision_mode='average', refinement=None):
     """
@@ -1429,6 +1332,7 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         if nv < min_v:
             refined |= insert_uniform_knots(bs, along_v=True, target_poles=min_v, tol=tol)
 
+    g1_poles = set()
     # Preprocess drivers
     for drv in drivers:
         driver_face = drv['driver_face']
@@ -1442,11 +1346,7 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
 
         # Detect direction and boundary index 
         along_v, boundary_index = detect_edge_direction_and_boundary(bs, edge)
-
-        drv['edge'] = edge
-        drv['along_v'] = along_v
-        drv['side'] = 1 if boundary_index == 0 else -1
-        drv['axis'] = 'U' if along_v else 'V'
+        side = 1 if boundary_index == 0 else -1
 
         if refine_surface:
             needs_refinement = False # even if user requested, doesnt mean we need it
@@ -1470,11 +1370,11 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
             tol = refinement.get("tol", 1e-9)
 
             # Sample tangents from driver face along edge, do not interpolate yet
-            driver_tangents_dir = sample_driver_tangents(driver_face, edge, samples, None)
+            driver_tangents_dir_samples = sample_driver_tangents(driver_face, edge, samples, None)
 
             # check curvature vs pole spacing
             h = pole_spacing(bs, along_v, boundary_index)
-            curvatures = sample_boundary_curvature(driver_face.Surface, edge, driver_tangents_dir)
+            curvatures = sample_boundary_curvature(driver_face.Surface, edge, driver_tangents_dir_samples)
             kappa = max(curvatures)
 
             if kappa * h * h > 0.25:
@@ -1495,19 +1395,50 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
                     boundary_bias = refinement.get("boundary_bias", 1.2)                    
                     refined |= insert_boundary_biased_knots(bs, not along_v, boundary_index, 
                         layers, boundary_bias, tol)
-                              
+
+        # After refinement (if any) boundary index may have changed
+        boundary_index = 0 if side == 1 else (bs.NbUPoles - 1 if along_v else bs.NbVPoles - 1)
+        
+        g1_index = boundary_index + side
+
+        if along_v:
+            for j in range(1, bs.NbVPoles-1):  # skip boundaries
+                g1_poles.add((g1_index, j))
+        else:
+            for i in range(1, bs.NbUPoles-1):  # skip boundaries
+                g1_poles.add((i, g1_index))
+
+        fairing_distance = drv.get('fairing_distance', 0.6)
+        spread = max(0, int(fairing_distance * (bs.NbUPoles if along_v else bs.NbVPoles)) - 2) # exclude boundaries and g1 row        
+        spread_rows = get_spread_rows(boundary_index+side, max(0, spread), side)
+        
+        decay_type = drv.get('decay_type', 'smooth')
+        if decay_type == 'linear':
+            decay = lambda d, md=spread: linear_decay(d, md)
+        elif decay_type == 'gaussian':
+            sigma = drv.get('gaussian_sigma', spread / 3.0)
+            decay = lambda d, s=sigma: gaussian_decay(d, s)
+        else:
+            decay = lambda d, md=spread: smooth_decay(d, md)
+
+        drv['edge'] = edge                              # shared edge
+        drv['along_v'] = along_v                        # boundary direction
+        drv['side'] = side                              # +1 if boundary_index == 0 else -1 
+        drv['spread_rows'] = spread_rows                # list of rows to spread G1 influence
+        drv['boundary_index'] = boundary_index          # updated boundary index after refinement
+        drv['decay'] = decay                            # decay function
+        
     # Debug: show modified surface after refinement
     # if refined:
     # show_surface(bs, "Refined_Surface")
 
-    nu, nv = bs.NbUPoles, bs.NbVPoles
     is_rational = isRational(bs)
 
     # Save original poles and weights
-    orig_poles = [[bs.getPole(i+1, j+1) for j in range(nv)] for i in range(nu)]
+    orig_poles = bs.getPoles()    
     orig_weights = None
     if is_rational:
-        orig_weights = [[bs.getWeight(i+1, j+1) for j in range(nv)] for i in range(nu)]
+        orig_weights = bs.getWeights()
 
     # Accumulators for pole deltas
     # (i, j): {
@@ -1521,28 +1452,29 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
     # Desired transverse directions per boundary pole (before spreading)
     # key = (u,v) - pole indices
     desired_dirs = defaultdict(list)
-    g1_intents = []   # list of dicts
-
+    
     # Process each driver
     for driver_idx, drv in enumerate(drivers):
         driver_face = drv['driver_face']
         samples = drv.get('samples', 30)
         beta = drv.get('beta', 1.0)
         edge = drv['edge']
-
+                
         if edge is None:
             # Find shared edge
             edge = find_shared_edge(target_face, driver_face)
 
         if edge is None:
-            App.Console.PrintWarning("Failed to find shared edge with driver face\n")
+            App.Console.PrintWarning(f"Failed to find shared edge with driver face. Driver {driver_idx} will be ignored.\n")
             continue
 
-        # Detect direction and boundary index 
-        along_v, boundary_index = detect_edge_direction_and_boundary(bs, edge)
+        boundary_index = drv['boundary_index']
+        along_v = drv['along_v']
+        spread_rows = drv.get('spread_rows', [])
+        side = drv['side']
+        decay = drv['decay']
 
-        row_len = nv if along_v else nu
-
+        row_len = bs.NbVPoles if along_v else bs.NbUPoles        
         # Sample tangents from driver face along edge (reuse your sampling code)
         driver_tangents_dir = sample_driver_tangents(driver_face, edge, samples, row_len)
 
@@ -1550,10 +1482,10 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         g1_row = compute_g1_row(orig_poles, driver_tangents_dir, along_v, boundary_index, beta)
 
         # Next to boundary row        
-        adj_row = boundary_index + (1 if boundary_index == 0 else -1)
+        adj_row = boundary_index + side
 
         # Capture desired transverse directions and intents to move poles
-        for j in range(row_len):
+        for j in range(1, row_len-1):  # skip boundaries
             # Get adjacent row pole
             if along_v:
                 i, jj = adj_row, j
@@ -1575,26 +1507,50 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
             dir = raw_delta.normalize()
 
             key = (i, jj)
+            g1_poles.add(key)
 
-            g1_intents.append({
-                "pole": (i, jj),            # adjacent row pole
-                "delta": delta,
-                "boundary": boundary_index, # boundary row index (0-based)
-                "along_v": along_v          # boundary direction
-            })
-            
             desired_dirs[key].append({
                 "dir": dir,
                 "mag": mag,
                 "along_v": along_v,
                 "boundary": boundary_index,
-                "driver_idx": driver_idx
+                "driver_idx": driver_idx,
+                "priority": 0           # high priority for adjacent row
             })
+
+            # Spread to interior rows
+            for r in spread_rows:
+                if decay is None:
+                    continue
+                
+                d = abs(r - adj_row)
+                d_mag = mag*decay(d)
+
+                if d_mag < 1e-6:
+                    continue
+
+                if along_v:
+                    key = (r, j)
+                else:
+                    key = (j, r)
+                
+                if key in g1_poles:                    
+                    continue  # do not override g1 poles
+
+                desired_dirs[key].append({
+                    "dir": dir,
+                    "mag": d_mag,
+                    "along_v": along_v,
+                    "boundary": boundary_index,
+                    "driver_idx": driver_idx,
+                    "priority": d           # further from g1 rows get lower priority based on distance
+                })
+
 
     pole_constraints = resolve_constraints(desired_dirs)
     pole_basis = build_pole_basis(bs)
     
-    def add_delta(i, j, delta,weight=None):
+    def add_delta(i, j, delta, weight=None):
         if delta.Length < 1e-9:
             return
         
@@ -1646,57 +1602,19 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         if d_orth.Length > 1e-9:
             acc["orthogonal"].append(d_orth)
 
-    # fixed poles set (boundary poles)
-    fixed = set()
-    for v in [0, nv-1]:
-        for i in range(nu):
-            fixed.add((i, v))
-    for u in [0, nu-1]:
-        for j in range(nv):
-            fixed.add((u, j))
-
     # Accumulate deltas from all intents and store boundary poles
-    for intent in g1_intents:
-        i, j = intent["pole"]
+    for key, items in desired_dirs.items():
+        i, j = key        
+        for item in items:
+            dir = item["dir"]
+            mag = item["mag"]
+            delta = App.Vector(dir).multiply(mag)
+            if is_rational:
+                add_delta(i, j, delta, orig_weights[i][j])
+            else:
+                add_delta(i, j, delta)
 
-        delta = App.Vector(intent["delta"])
-        if is_rational:
-            add_delta(i, j, delta, orig_weights[i][j])
-        else:
-            add_delta(i, j, delta)
-
-    # Track moved (G1) poles for fairing, exclude boundaries
-    # set of (i,j)
-    moved = set()    
-    for (i, j), acc in delta_accum.items():
-        if acc["parallel"] or (acc["orthogonal"] and len(acc["orthogonal"]) > 0):
-            moved.add((i, j))
-
-    def add_fairing_delta(i, j, delta, weight=1.0, d = 0):
-        if delta.Length < 1e-9:
-            return
-
-        # never move fixed / constrained poles
-        if (i, j) in fixed or (i, j) in moved:
-            return
-
-        key = (i, j)
-        if key not in delta_accum:
-            delta_accum[key] = {
-                "parallel": None,
-                "orthogonal": [],
-                "fairing": [],
-                "raw": [],
-                "weights": []
-            }
-
-        # print(f"Applying propagated fairing delta to pole({i}, {j}) with magnitude {delta.Length}; decay weight {weight}; distance {d}")
-               
-
-        # fairing is always orthogonal to constraints
-        delta_accum[key]["fairing"].append(App.Vector(delta).multiply(weight))
-
-    # Apply accumulated deltas to adjacent row poles solving conflicts
+    # Apply accumulated deltas to row poles solving conflicts
 
     # Compute final poles by averaging deltas
     if collision_mode == 'average':
@@ -1731,65 +1649,8 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
                     avg_weight = w_avg(acc["weights"])
                 bs.setWeight(i + 1, j + 1, avg_weight)
     
-    # show_surface(bs, "G1_Enforced_Surface_Raw")
-
-    # Compute distance field from fixed poles (boundary and constrained)
-    dist = compute_distance_to_fixed(nu, nv, moved)
-    # print("Distance field:")
-    # for j in range(nv):
-    #     print([dist[i][j] for i in range(nu)])
-
-    # gather fairing drivers
-    drivers_fairing = []
-    for drv in drivers:
-        axis = drv.get('axis', 'U')
-        side = drv.get('side', 1)
-        spread = int(1.0 * max([d for rows in dist for d in rows]))
-        strength = drv.get('fairing_strength', 0.8)
-
-        driver = FairingDriver(
-            axis=axis,
-            side=side,
-            max_dist=spread,
-            strength=strength,
-            decay=lambda d, md=spread: smooth_decay(d, md)
-        )
-
-        drivers_fairing.append(driver)
-
-    propagate_g1_fairing(g1_intents, drivers_fairing, nu, nv, add_fairing_delta)
-    # deltas = []
-    for (i, j), acc in delta_accum.items():
-        d = App.Vector(0, 0, 0)
-        if acc["fairing"] and len(acc["fairing"]) > 0:
-            d = d.add(v_avg(acc["fairing"]))
-
-        if d.Length < 1e-9:
-            continue
-        # deltas.append(orig_poles[i][j].add(d))
-        bs.setPole(i + 1, j + 1, orig_poles[i][j].add(d))
-    
     # draw_points(deltas, (1.0, 0.0, 1.0), 0.2, "Faired_Poles")
 
-    # Laplacian based fairing - save for now just in case
-
-    # Run fairing multiple times for better effect
-    # for _ in range(3):    
-    #     poles = [[bs.getPole(i+1, j+1) for j in range(nv)] for i in range(nu)]
-
-    #     fair_surface(poles, drivers_fairing, fixed, moved, dist, add_delta=add_fairing_delta)
-
-    #     # apply fairing deltas, just an average
-    #     for (i, j), acc in delta_accum.items():
-    #         d = App.Vector(0, 0, 0)
-    #         # --- fairing (soft, damped) ---
-    #         if acc["fairing"] and len(acc["fairing"]) > 0:
-    #             d = d.add(v_avg(acc["fairing"]))
-
-    #         if d.Length < 1e-9:
-    #             continue
-
-    #         bs.setPole(i + 1, j + 1, orig_poles[i][j].add(d))
     return bs
 
 def getSelectedFaces():
@@ -1816,9 +1677,11 @@ driver_faces = selection_faces[1:]
 drivers = []
 for f in driver_faces:
     drivers.append({
-        'driver_face': f,   # tool face
-        'samples': 30,      # (optional, default 30) number of samples along edge
-        'beta': 1.0,        # blending factor (0.0 - 1.0). Higher = stronger driver influence.        
+        'driver_face': f,       # tool face
+        'samples': 50,          # (optional, default 30) number of samples along edge
+        'beta': 1.0,            # g1 factor (0.0 - 1.0). Higher = stronger driver influence.
+        'decay_type': 'smooth', # 'linear', 'smooth', 'gaussian' (optional, default 'smooth')
+        'fairing_distance': 0.6 # (optional, default 0.8) fairing distance as fraction of pole count along fairing direction
     })
 
 # Optional: refinement before G1 enforcement
