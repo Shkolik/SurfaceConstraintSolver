@@ -8,66 +8,9 @@ from collections import defaultdict
 import math
 import FreeCAD as App
 import Part
+import math
 
 ### Debug visualization utilities ###
-
-def draw_vector(point, vector, color=(1.0,0,0), scale=10.0, name_prefix="Vec", show=True):
-    """
-    Method to draw a vector as a line in FreeCAD for visualization.
-    
-    Args:
-        point: Starting point (App.Vector)
-        vector: Vector to draw (App.Vector)
-        color: Line color (r,g,b)
-        scale: Scale factor for vector length if vector is unit length
-        name_prefix: Name prefix for the object
-        show: Whether to create the object in FreeCAD document
-    Returns:
-        Part.Edge or None: The created edge or None if vector is invalid
-    """
-    if vector is None or vector.Length < 1e-9:
-        return None
-    
-    end = App.Vector(vector)
-    if end.Length <= 1:
-        # end = vector.normalize().multiply(scale)
-        end.normalize()
-        end.multiply(scale)
-
-    p1 = point
-    p2 = point.add(end)
-    edge = Part.makeLine(p1, p2)
-
-    if show:
-        obj = App.ActiveDocument.addObject("Part::Feature", name_prefix)
-        obj.Shape = edge
-        obj.ViewObject.ShapeColor = color
-        obj.ViewObject.LineColor = color
-        obj.ViewObject.PointColor = color
-    return edge
-
-def draw_points(points, color=(1.0,0,0), size=2.0, name="Pt", show=True):    
-    """
-    Method to draw points as spheres in FreeCAD for visualization.
-
-    Args:
-        points: List of points (App.Vector)
-        color: Sphere color (r,g,b)
-        size: Sphere radius
-        name: Name for the object
-        show: Whether to create the object in FreeCAD document
-    Returns:
-        Part.Compound or None: The Compound of spheres or None if not shown
-    """    
-    compound = Part.makeCompound([Part.makeSphere(size, point) for point in points])
-
-    if show:
-        obj = App.ActiveDocument.addObject("Part::Feature", name)
-        obj.Shape = compound
-        obj.ViewObject.ShapeColor = color
-        obj.ViewObject.LineColor = color
-        obj.ViewObject.PointColor = color
-    return compound
 
 def show_object(shape, name="DebugShape", color=(0.0,1.0,0.0)):
     """
@@ -103,6 +46,106 @@ def show_surface(bs, name="DebugSurface", color=None):
     if color:
         obj.ViewObject.ShapeColor = color
     return obj
+
+def draw_point(point, color=(1.0,0,0), size=0.2, name="Pt", show=True):    
+    """
+    Method to draw points as spheres in FreeCAD for visualization.
+
+    Args:
+        point: point (App.Vector)
+        color: Sphere color (r,g,b)
+        size: Sphere radius
+        name: Name for the object
+        show: Whether to create the object in FreeCAD document
+    Returns:
+        Part.Shape: The created sphere
+    """    
+    p = Part.makeSphere(size, point)
+    
+    if show:
+        show_object(p, name=name, color=color)
+    return p
+
+def draw_vector(point, vector, color=(1.0,0,0), scale=10.0, name="Vec", show=True):
+    """
+    Method to draw a vector as a line in FreeCAD for visualization.
+    
+    Args:
+        point: Starting point (App.Vector)
+        vector: Vector to draw (App.Vector)
+        color: Line color (r,g,b)
+        scale: Scale factor for vector length if vector is unit length
+        name_prefix: Name prefix for the object
+        show: Whether to create the object in FreeCAD document
+    Returns:
+        Part.Edge or None: The created edge or None if vector is invalid
+    """
+    if vector is None or vector.Length < 1e-9:
+        return None
+    
+    end = App.Vector(vector)
+    if end.Length <= 1:
+        # end = vector.normalize().multiply(scale)
+        end.normalize()
+        end.multiply(scale)
+
+    p1 = point
+    p2 = point.add(end)
+    edge = Part.makeLine(p1, p2)
+    p = draw_point(p2, color=color, show=False)
+    comp = Part.makeCompound([edge, p])
+    if show:
+        show_object(comp, name, color=color)
+    return comp
+
+def draw_vectors(points, vectors, color=(1.0,0,0), scale=10.0, name="Vectors", show=True):    
+    """
+    Method to draw multiple vectors as lines in FreeCAD for visualization.
+
+    Args:
+        points: List of starting points (App.Vector)
+        vectors: List of vectors to draw (App.Vector)
+        color: Line color (r,g,b)
+        scale: Scale factor for vector length if vector is unit length
+        name: Name for the object
+        show: Whether to create the object in FreeCAD document
+    Returns:
+        Part.Compound or None: The Compound of vectors
+    """
+    vecs = []
+    for point, vector in zip(points, vectors):
+        vec = draw_vector(point, vector, color=color, scale=scale, name=name, show=False)
+        if vec:
+            vecs.append(vec)
+    comp = Part.makeCompound(vecs)
+    if show:
+        show_object(comp, name=name, color=color)
+    return comp
+
+def draw_points(points, color=(1.0,0,0), size=2.0, name="Pt", show=True):    
+    """
+    Method to draw points as spheres in FreeCAD for visualization.
+
+    Args:
+        points: List of points (App.Vector)
+        color: Sphere color (r,g,b)
+        size: Sphere radius
+        name: Name for the object
+        show: Whether to create the object in FreeCAD document
+    Returns:
+        Part.Compound or None: The Compound of spheres
+    """    
+    compound = Part.makeCompound([Part.makeSphere(size, point) for point in points])
+
+    if show:
+        obj = App.ActiveDocument.addObject("Part::Feature", name)
+        obj.Shape = compound
+        obj.ViewObject.ShapeColor = color
+        obj.ViewObject.LineColor = color
+        obj.ViewObject.PointColor = color
+    return compound
+### End debug visualization utilities ###
+
 
 #### Core functionality ###
 
@@ -245,160 +288,60 @@ def insert_boundary_biased_knots(bs, along_v, boundary_index, layers=3, bias=3.0
 
     return modified
 
-def transverse_curvature_proxy(surface, point, transverse_dir, tol=1e-9):
+def weighted_refine_params(params, weights, layers):
+    inserts = []
+    n = len(params)
+
+    for layer in range(layers):
+        acc = 0.0
+        target = (layer + 1) / (layers + 1)
+
+        for i in range(n - 1):
+            acc += weights[i]
+            if acc >= target:
+                t = 0.5 * (params[i] + params[i + 1])
+                inserts.append(t)
+                break
+
+    return inserts
+
+def compute_mismatch_weights(driver_dirs, target_dirs, eps=1e-6):
+    weights = []
+    for td, ts in zip(driver_dirs, target_dirs):
+        w = App.Vector(td).sub(ts).Length
+        weights.append(max(w, eps))
+    return weights
+
+def normalize_weights(w):
+    s = sum(w)
+    if s < 1e-12:
+        return [1.0 / len(w)] * len(w)
+    return [x / s for x in w]
+
+def insert_mismatch_weighted_knots(bs, along_v, boundary_index, edge,
+        driver_dirs, target_dirs, layers=3, tol=1e-9):
     """
-    Approximate geometric curvature magnitude in transverse direction.
+    Insert transverse knots near boundary weighted by tangent mismatch.
+
     Args:
-        surface: (Part.Surface) driver surface
-        point: (App.Vector) origin point
-        transverse_dir: (App.Vector) direction (unit)
-        tol: (float) tolerance for first derivative
-    """    
-    u, v = surface.parameter(point)
-
-    # First derivatives (world space)
-    Du = surface.getDN(u, v, 1, 0)
-    Dv = surface.getDN(u, v, 0, 1)
-
-    # Second derivatives
-    Duu = surface.getDN(u, v, 2, 0)
-    Dvv = surface.getDN(u, v, 0, 2)
-    Duv = surface.getDN(u, v, 1, 1)
-
-    # Solve Td ≈ a*Du + b*Dv (least squares)
-
-    # Normal equation coefficients
-    suu = Du.dot(Du)
-    svv = Dv.dot(Dv)
-    suv = Du.dot(Dv)
-
-    rhs_u = transverse_dir.dot(Du)
-    rhs_v = transverse_dir.dot(Dv)
-
-    det = suu * svv - suv * suv
-    if abs(det) < 1e-12:
-        # Fallback: Project onto dominant direction
-        if Du.Length > Dv.Length:
-            d1 = Du
-            d2 = Duu
-        else:
-            d1 = Dv
-            d2 = Dvv
-
-        if d1.Length < tol:
-            return 0.0
-
-        return d2.Length / (d1.Length * d1.Length)
-
-    inv = 1.0 / det
-    a = inv * ( rhs_u * svv - rhs_v * suv )
-    b = inv * ( rhs_v * suu - rhs_u * suv )
-
-    # First derivative along transverse_dir
-    d1 = Du.multiply(a).add(Dv.multiply(b))
-    d1_len = d1.Length
-    if d1_len < tol:
-        return 0.0
-
-    # Second derivative along transverse_dir
-    d2 = (
-        Duu.multiply(a * a)
-        .add(Dvv.multiply(b * b))
-        .add(Duv.multiply(2.0 * a * b))
-    )
-
-    # Geometric curvature magnitude
-    return d2.Length / (d1_len * d1_len)
-
-def sample_boundary_curvature(surface, edge, transverse_dirs):
-    """
-    Returns curvature values per boundary sample.
-    Args:
-        surface: (Part.Surface) driver surface
-        edge: (Part.Edge) shared edge
-        transverse_dirs: list of (App.Vector) (unit) or None
-    Returns:    
-        curvatures: list of float curvature values
-    """
-    u0, u1 = edge.ParameterRange
-    samples = len(transverse_dirs)
-    curvatures = []
-
-    for i in range(samples):
-        t = u0 + (u1 - u0) * i / (samples - 1)
-        p = edge.Curve.value(t)
-
-        Td = transverse_dirs[i]
-        if Td is None:
-            curvatures.append(0.0)
-            continue
-
-        k = transverse_curvature_proxy(surface, p, Td)
-        curvatures.append(k)
-
-    return curvatures
-
-def curvature_weighted_params(params, curvatures, layers=3, min_weight=0.1):
-    """
-    Generate parameter locations biased by curvature.
-    Args:
-        params: list of (float) parameter locations
-        curvatures: list of (float) curvature values
-        layers: (int) number of layers to insert
-        min_weight: (float) minimum weight to avoid zero insertions
+        bs (Part.BSplineSurface): target surface
+        along_v (bool): True → boundary is U=const (refine V)
+        boundary_index (int): 0 or max index of boundary row/column
+        edge (Part.Edge): edge corresponding to boundary
+        driver_dirs (list of App.Vector): driver transverse tangents
+        target_dirs (list of App.Vector): target transverse tangents
+        layers (int): number of layers to insert
+        tol (float) : knot insertion tolerance
     Returns:
-        list of (float) new parameter locations
+        bool: True if the surface was modified, False otherwise
     """
-    if not params or not curvatures:
-        return []
 
-    # Normalize curvature
-    max_k = max(curvatures)
-    if max_k < 1e-9:
-        return []
-
-    weights = [max(k / max_k, min_weight) for k in curvatures]
-
-    selected = []
-    used = set()
-
-    for _ in range(layers):
-        # Pick strongest unused location
-        best_i = None
-        best_k = -1
-
-        for i, k in enumerate(weights):
-            if i in used:
-                continue
-            if k > best_k:
-                best_k = k
-                best_i = i
-
-        if best_i is None:
-            break
-
-        selected.append(params[best_i])
-        used.add(best_i)
-
-    return selected
-
-def insert_curvature_weighted_knots(bs, along_v, boundary_index, 
-                                    edge, curvatures, layers=3, tol=1e-9):
-    """
-    Insert knots near boundary weighted by transverse curvature.
-    Args:
-        bs: (Part.BSplineSurface) surface to refine (MODIFIED IN PLACE)
-        along_v: (bool) True → boundary is U=const (refine V)
-        boundary_index: (int) 0 or max index of boundary row/column
-        edge: (Part.Edge) shared edge
-        curvatures: list of (float) geometric curvature values per sample
-        layers: (int) number of layers to insert
-        tol: (float) knot insertion tolerance
-    """
-    if curvatures is None or len(curvatures) == 0:
+    if not driver_dirs or not target_dirs:
         return False
-    
-    samples = len(curvatures)
+
+    samples = min(len(driver_dirs), len(target_dirs))
+    driver_dirs = driver_dirs[:samples]
+    target_dirs = target_dirs[:samples]
 
     # Direction setup
     if along_v:
@@ -409,16 +352,21 @@ def insert_curvature_weighted_knots(bs, along_v, boundary_index,
         param_min, param_max = bs.bounds()[0:2]
 
     u0, u1 = edge.ParameterRange
-    params = [u0 + (u1 - u0) * i / (samples - 1) for i in range(samples)]
+    edge_params = [u0 + (u1 - u0) * i / (samples - 1)
+                   for i in range(samples)]
 
-    # Compute insert locations
-    refine_params = curvature_weighted_params(
-        params,
-        curvatures,
-        layers=layers
+    # Compute mismatch weights
+    weights = compute_mismatch_weights(driver_dirs, target_dirs)
+    weights = normalize_weights(weights)
+
+    # Generate insertion parameters
+    refine_params = weighted_refine_params(
+        edge_params,
+        weights,
+        layers
     )
 
-    # Map edge parameter → surface parameter
+    # Map edge → surface parameter
     eps = (param_max - param_min) * 1e-6
     at_start = (boundary_index == 0)
     boundary_param = param_min if at_start else param_max
@@ -428,12 +376,9 @@ def insert_curvature_weighted_knots(bs, along_v, boundary_index,
         s = (t - u0) / (u1 - u0)
         d = s * (param_max - param_min) * 0.5
 
-        if at_start:
-            u = boundary_param + d
-        else:
-            u = boundary_param - d
-
+        u = boundary_param + d if at_start else boundary_param - d
         u = max(param_min + eps, min(param_max - eps, u))
+
         insert(u)
         modified = True
 
@@ -819,80 +764,156 @@ def find_transverse_tangent(driver_face, point, edge_tangent):
 
     return d_dir
 
-def sample_driver_tangents(driver_face, edge, samples, row_len):
+def boundary_pole_params(bs, along_v, boundary_index):
     """
-    Sample driver surface tangents and interpolate to match target row poles.
-    
+    Return surface parameters corresponding to boundary poles.
+
     Args:
-        driver_face: Driver surface (Part.Face)
-        edge: Shared edge (Part.Edge)
-        samples: Number of samples along the edge
-        row_len: Number of poles in the target row. If None, no interpolation will be done.
+        bs (Part.BSplineSurface): target surface
+        along_v (bool):
+            True  → boundary is U = const, poles vary along V
+            False → boundary is V = const, poles vary along U
+        boundary_index (int):
+            0 → first boundary
+            >0 → last boundary
+
     Returns:
-        list of App.Vector (unit) or None
+        list[float]: parameter values along boundary direction
+                     (U or V depending on along_v)
+    """
+
+    nu = bs.NbUPoles
+    nv = bs.NbVPoles
+
+    params = []
+
+    if along_v:
+        # U = const boundary, iterate along V
+        i = 1 if boundary_index == 0 else nu
+        for j in range(1, nv + 1):
+            P = bs.getPole(i, j)
+            u, v = bs.parameter(P)
+            params.append(v)
+    else:
+        # V = const boundary, iterate along U
+        j = 1 if boundary_index == 0 else nv
+        for i in range(1, nu + 1):
+            P = bs.getPole(i, j)
+            u, v = bs.parameter(P)
+            params.append(u)
+
+    return params
+
+def get_surface_boundary_tangents(face, edge, samples = 30, pole_params = None):
+    """
+    Get transverse tangents at boundary poles.
+
+    Args:
+        face: Part.Face
+        edge: Part.Edge
+        samples: int    (number of samples along edge)    
+        pole_params: list of float (surface parameters u or v of boundary poles)
+    Returns:
+        list of App.Vector (unit) per boundary pole
     """
     u0, u1 = edge.ParameterRange
+    eps = (u1 - u0) * 1e-9
 
-    tangents = [] # tangent directions at samples
+    # Sample driver tangents along edge
+    sample_params = []
+    sample_dirs = []
 
     for i in range(samples):
-        if i == samples - 1:
-            t = u1 - 1e-9  # small offset before the end
-        elif i == 0:
-            t = u0 + 1e-9  # small offset after the start
+        if i == 0:
+            t = u0 + eps
+        elif i == samples - 1:
+            t = u1 - eps
         else:
             t = u0 + (u1 - u0) * i / (samples - 1)
-        
+
         p = edge.Curve.value(t)
 
+        # Edge tangent
         Te = edge.Curve.tangent(t)[0]
         if Te.Length < 1e-9:
-            tangents.append(None)
             continue
         Te.normalize()
-        
-        d_dir = find_transverse_tangent(driver_face, p, Te)
 
-        if d_dir is None:
-            tangents.append(None)
+        # Transverse tangent on surface
+        Td = find_transverse_tangent(face, p, Te)
+        if Td is None or Td.Length < 1e-9:
             continue
 
-        tangents.append(d_dir)
+        Td.normalize()
 
-    if not row_len:
-        return tangents
-    
-    # Interpolate to match row_len
-    tangent_at_pole_dir = []
+        sample_params.append(t)
+        sample_dirs.append(Td)
 
-    for j in range(row_len):
-        s = j * (samples - 1) / (row_len - 1)
-        i0 = int(s)
-        i1 = min(i0 + 1, samples - 1)
-        w = s - i0
+    if len(sample_dirs) < 2:
+        raise RuntimeError("Insufficient valid driver tangents")
 
-        T0 = tangents[i0]
-        T1 = tangents[i1]
+    # Ensure directional consistency
+    for i in range(1, len(sample_dirs)):
+        if sample_dirs[i - 1].dot(sample_dirs[i]) < 0:
+            sample_dirs[i] = sample_dirs[i].negative()
 
-        if T0 is None and T1 is None:
-            raise RuntimeError("No valid driver tangents")
+    if not pole_params:
+        return sample_dirs
 
-        if T0 is None:
-            T = App.Vector(T1)
-        elif T1 is None:
-            T = App.Vector(T0)
+    # Map pole parameters to edge parameters
+    # Normalize pole params to edge parameter space
+    pole_dirs = []
+    pole_locs = []
+    for p in pole_params:
+        # Clamp to sample params range
+        pe = max(min(sample_params), min(max(sample_params), p))
+
+        # Find bracketing samples
+        for k in range(len(sample_params) - 1):
+            t0 = sample_params[k]
+            t1 = sample_params[k + 1]
+
+            if pe >= t0 and pe <= t1:                
+                w = (pe - t0) / (t1 - t0)
+                d0 = App.Vector(sample_dirs[k])
+                d1 = App.Vector(sample_dirs[k + 1])
+
+                # Ensure same orientation - redundant but safer
+                if d0.dot(d1) < 0:
+                    d1 = d1.negative()
+
+                Td = d0.multiply(1 - w).add(d1.multiply(w))
+                if Td.Length < 1e-9:
+                    Td = App.Vector(sample_dirs[k])
+
+                Td.normalize()
+                pole_locs.append(edge.Curve.value(pe))
+                pole_dirs.append(Td)
+                break
         else:
-            if T0.dot(T1) < 0:
-                T1 = T1.negative()
-            T = lerp(T0, T1, w)
-
-        if T.Length < 1e-9:
-            raise RuntimeError("Failed to compute valid tangent")
-
-        T.normalize()
-        tangent_at_pole_dir.append(T)
-        
-    return tangent_at_pole_dir
+            # Outside range (numerical edge case)
+            if pe < sample_params[0]:
+                pole_dirs.append(App.Vector(sample_dirs[0]))
+            else:
+                pole_dirs.append(App.Vector(sample_dirs[-1]))
+                
+    # draw_vectors(
+    #     [edge.Curve.value(t) for t in sample_params],
+    #     sample_dirs,
+    #     color=(1.0,0.5,0.0),
+    #     scale=10.0,
+    #     name="Driver_Tangents_Orange",
+    #     show=True
+    # )
+    # draw_vectors(
+    #     pole_locs,
+    #     pole_dirs,
+    #     color=(0.0,0.0,1.0),
+    #     scale=10.0,
+    #     name="Pole_Tangents_Blue",
+    #     show=True
+    # )
+    return pole_dirs
 
 def compute_g1_row(orig_poles, driver_tangents_dir, along_v, boundary_index, beta):
     """
@@ -1013,38 +1034,39 @@ def pole_spacing(bs, along_v, boundary_index):
 
     return sum(spacings) / max(len(spacings), 1)
 
-def estimate_refinement_layers(h, kappa, tol=0.25):
+def estimate_refinement_layers(driver_dirs, target_dirs, beta, degree, tol=0.15, max_layers=8):
     """
-    Estimate the number of refinement layers needed based on pole spacing and curvature.
-    
+    Estimate transverse refinement layers from predicted G1 energy
     Args:
-        h: (float) Current pole spacing near boundary
-        kappa: (float) Curvature magnitude
-        tol: (float) Tolerance for acceptable deviation
-    Returns: number of layers to insert
+        driver_dirs: list of App.Vector (unit) from driver surface
+        target_dirs: list of App.Vector (unit) from target surface
+        beta: blending factor
+        degree: surface degree in refinement direction
+        tol: tolerance for acceptable energy
+        max_layers: maximum allowed refinement layers
     """
-    if kappa < 1e-12:  # avoid division by zero, or very small curvature
-        return 0
-    h_target = (tol / kappa) ** 0.5
-    layers = max(0, math.ceil(math.log2(h / h_target)))
-    return layers
 
-def can_apply_weighted_refinement(surface, alongV):
-    """
-    Check if surface can be refined using curvature-weighted method.
+    if degree <= 0 or not driver_dirs:
+        return 0
+
+    max_mismatch = 0.0
+
+    for td, ts in zip(driver_dirs, target_dirs):
+        d = App.Vector(td).sub(ts)
+        max_mismatch = max(max_mismatch, d.Length)
+
+    # predicted dimensionless energy
+    E = beta * max_mismatch / degree
+
+    if E < tol:
+        return 0
     
-    Args:
-        surface: target BSpline surface
-        alongV: True if refining along V, False if U
-    Returns:
-        True if refinement can be applied, False otherwise
-    """
-    degree = surface.VDegree if alongV else surface.UDegree
-    poles_count = surface.NbVPoles if alongV else surface.NbUPoles
-    # Minimum degree and poles count for meaningful weighted refinement
-    if degree < 3 or poles_count < 4:
-        return False
-    return True
+    if E > 6.0:
+        App.Console.PrintWarning(f"High predicted G1 energy={E:.2f}. G1 may not be possible.\n")
+        return max_layers
+
+    layers = int(math.ceil(math.sqrt(E / tol)))
+    return max(0, min(layers, max_layers))
 
 def resolve_constraints(desired_dirs):
     """
@@ -1204,7 +1226,6 @@ def effective_max_mag(c):
         return c["max_mag"]
     return c["max_mag"] * (1.0 / (0.3 + c["priority"]))
 
-
 def apply_constraint(delta, c):
     if delta.Length < 1e-9:
         return delta
@@ -1349,13 +1370,6 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         side = 1 if boundary_index == 0 else -1
 
         if refine_surface:
-            needs_refinement = False # even if user requested, doesnt mean we need it
-
-            # check if weighted refinement is possible before degree elevation
-            # weighted_refinement inserts knots based on curvature, and if initial degree is too low, 
-            # it may not work well even after elevation -> curvature will stay the same
-            weighted_possible = can_apply_weighted_refinement(bs, along_v)
-
             # check degree in refinement direction and if less than 3, elevate
             # along_v indicates boundary direction, so refinement is perpendicular
             degree = bs.VDegree if not along_v else bs.UDegree
@@ -1368,29 +1382,24 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
 
             refinement_method = refinement.get("method", "uniform")                     
             tol = refinement.get("tol", 1e-9)
-
+            beta = drv.get('beta', 1.0)
+           
             # Sample tangents from driver face along edge, do not interpolate yet
-            driver_tangents_dir_samples = sample_driver_tangents(driver_face, edge, samples, None)
+            driver_tangents_dir_samples = get_surface_boundary_tangents(driver_face, edge, samples, None)
 
-            # check curvature vs pole spacing
-            h = pole_spacing(bs, along_v, boundary_index)
-            curvatures = sample_boundary_curvature(driver_face.Surface, edge, driver_tangents_dir_samples)
-            kappa = max(curvatures)
+            # Sample tangents from target face along edge, do not interpolate yet
+            target_tangents_dir_samples = get_surface_boundary_tangents(target_face, edge, samples, None)
 
-            if kappa * h * h > 0.25:
-                needs_refinement = True
-
-            if needs_refinement:
-                layers = max(refinement.get("layers", 0), estimate_refinement_layers(h, kappa, tol=0.25))
-
-                if layers == 0:
-                    App.Console.PrintWarning("Refinement needed but no layers estimated or provided\n")
-                    continue  # no refinement needed or possible
-
-                if refinement_method == "weighted" and weighted_possible:
+            # estimate refinement layers from tangent mismatch
+            # Sample tangents from driver face along edge, do not interpolate yet
+            layers = estimate_refinement_layers(driver_tangents_dir_samples, target_tangents_dir_samples,
+                        beta, degree, tol=0.15)
+                        
+            if layers > 0:
+                if refinement_method == "weighted":
                     # compute weights based on driver tangents
-                    refined |= insert_curvature_weighted_knots(bs, not along_v, boundary_index, 
-                        edge, curvatures, layers, tol)
+                    refined |= insert_mismatch_weighted_knots(bs, not along_v, boundary_index, edge,
+                                driver_tangents_dir_samples, target_tangents_dir_samples, layers, tol)
                 else:
                     boundary_bias = refinement.get("boundary_bias", 1.2)                    
                     refined |= insert_boundary_biased_knots(bs, not along_v, boundary_index, 
@@ -1427,7 +1436,7 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         drv['spread_rows'] = spread_rows                # list of rows to spread G1 influence
         drv['boundary_index'] = boundary_index          # updated boundary index after refinement
         drv['decay'] = decay                            # decay function
-        
+    
     # Debug: show modified surface after refinement
     # if refined:
     # show_surface(bs, "Refined_Surface")
@@ -1473,10 +1482,18 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
         spread_rows = drv.get('spread_rows', [])
         side = drv['side']
         decay = drv['decay']
+        
+        # Get exact boundary pole parameters
+        pole_params = boundary_pole_params(bs, along_v, boundary_index)
 
-        row_len = bs.NbVPoles if along_v else bs.NbUPoles        
-        # Sample tangents from driver face along edge (reuse your sampling code)
-        driver_tangents_dir = sample_driver_tangents(driver_face, edge, samples, row_len)
+        # Sample driver tangents aligned to those poles
+        driver_tangents_dir = get_surface_boundary_tangents(driver_face, edge, samples, pole_params)
+
+        row_len = bs.NbVPoles if along_v else bs.NbUPoles
+
+        if row_len != len(driver_tangents_dir):
+            App.Console.PrintWarning(f"Mismatch row length. tangents length: {len(driver_tangents_dir)}, row length: {row_len}\n")
+            continue
 
         # Compute new G1 row
         g1_row = compute_g1_row(orig_poles, driver_tangents_dir, along_v, boundary_index, beta)
