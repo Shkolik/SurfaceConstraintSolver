@@ -6,6 +6,7 @@ __license__ = "LGPL 2.1+"
 
 from collections import defaultdict
 import math
+from time import time
 import FreeCAD as App
 import Part
 import math
@@ -220,6 +221,38 @@ def insert_uniform_knots(bs, along_v, target_poles=8, tol=1e-9):
 
     return modified
 
+def insert_boundary_parallel_knots(bs, along_v, edge, layers, tol=1e-9):
+    """
+    Insert knots parallel to boundary direction to increase tangential DOF.
+    """
+    if layers <= 0:
+        return False
+
+    # Determine knot insertion direction
+    if along_v:
+        insert = lambda t: bs.insertUKnot(t, 1, tol)
+        param_min, param_max = bs.bounds()[0:2]
+    else:
+        insert = lambda t: bs.insertVKnot(t, 1, tol)
+        param_min, param_max = bs.bounds()[2:4]
+
+    u0, u1 = edge.ParameterRange
+    eps = (param_max - param_min) * 1e-6
+
+    modified = False
+
+    # Uniform subdivision of boundary parameter
+    for k in range(1, layers + 1):
+        s = k / (layers + 1)
+        t = u0 + s * (u1 - u0)
+
+        # Clamp safely
+        t = max(param_min + eps, min(param_max - eps, t))
+        insert(t)
+        modified = True
+
+    return modified
+
 def insert_boundary_biased_knots(bs, along_v, boundary_index, layers=3, bias=3.0, tol=1e-9):
     """
     Insert knots clustered near a boundary to increase DOF
@@ -380,6 +413,191 @@ def insert_mismatch_weighted_knots(bs, along_v, boundary_index, edge,
         u = max(param_min + eps, min(param_max - eps, u))
 
         insert(u)
+        modified = True
+
+    return modified
+
+def estimate_max_tangent_angle(driver_dirs, target_dirs):
+    """
+    Estimate maximum angular mismatch between driver and target boundary tangents.
+
+    Args:
+        driver_dirs: list[App.Vector or None] - normalized directions
+        target_dirs: list[App.Vector or None] - normalized directions
+
+    Returns:
+        float - maximum angle in radians
+    """
+    if not driver_dirs or not target_dirs:
+        return 0.0
+
+    max_angle = 0.0
+
+    for d,t in zip(driver_dirs, target_dirs):
+
+        if d is None or t is None:
+            continue
+
+        if d.Length < 1e-9 or t.Length < 1e-9:
+            continue
+
+        # Ensure unit length (cheap safety)
+        d = App.Vector(d)
+        t = App.Vector(t)
+        d.normalize()
+        t.normalize()
+
+        # Ignore sign (tangent orientation)
+        dot = abs(d.dot(t))
+
+        # Numerical clamp
+        dot = max(-1.0, min(1.0, dot))
+
+        angle = math.acos(dot)
+        max_angle = max(angle, max_angle)
+
+    return max_angle
+
+def estimate_boundary_angular_capacity(bs, along_v, boundary_index):
+    """
+    Estimate how much tangent angle the surface can represent along the boundary
+    without adding parallel knots.
+    Args:
+        bs (Part.BSplineSurface): target surface
+        along_v (bool): True → boundary is V=const (measure along U)
+        boundary_index (int): index of boundary row/column
+    Returns:
+        float - maximum angle in radians
+    """
+    if along_v:
+        # boundary is U = const → measure along U
+        row = [bs.getPole(i+1, boundary_index + 1) for i in range(bs.NbUPoles)]        
+    else:
+        # boundary is V = const → measure along V
+        row = [bs.getPole(boundary_index + 1, j+1) for j in range(bs.NbVPoles)]
+
+    angles = []
+    for i in range(len(row) - 2):
+        v1 = row[i+1].sub(row[i])
+        v2 = row[i+2].sub(row[i+1])
+        if v1.Length < 1e-9 or v2.Length < 1e-9:
+            continue
+        v1.normalize()
+        v2.normalize()
+        angles.append(math.acos(max(-1.0, min(1.0, v1.dot(v2)))))
+
+    return max(angles) if angles else 0.0
+
+def estimate_parallel_refinement_need(
+    sample_params,
+    angle_samples_rad,
+    hot_angle_rad=0.17,   # ~10 degrees
+    min_ratio=2.0
+):
+    """
+    Decide whether localized parallel refinement is needed.
+
+    Args:
+        sample_params: list[float] – boundary params (monotone)
+        angle_samples_rad: list[float] – tangent mismatch angles
+        hot_angle_rad: float – threshold for "hot" region
+        min_ratio: float – stiffness threshold
+
+    Returns:
+        dict or None:
+            {
+                "u0": float,
+                "u1": float,
+                "ratio": float,
+                "severity": float
+            }
+    """
+    assert len(sample_params) == len(angle_samples_rad)
+
+    # Detect hot region
+    hot_idx = [i for i,a in enumerate(angle_samples_rad) if a >= hot_angle_rad]
+    if not hot_idx:
+        return None
+
+    i0, i1 = hot_idx[0], hot_idx[-1]
+    u0, u1 = sample_params[i0], sample_params[i1]
+    hot_width = max(u1 - u0, 1e-12)
+
+    # Effective tangential stiffness proxy:
+    # assume first interior row "sees" one knot span
+    # we normalize by boundary param length = 1.0
+    stiffness_ratio = 1.0 / hot_width
+
+    if stiffness_ratio < min_ratio:
+        return None
+
+    severity = max(angle_samples_rad[i0:i1+1]) / hot_angle_rad
+
+    return {
+        "u0": u0,
+        "u1": u1,
+        "ratio": stiffness_ratio,
+        "severity": severity
+    }
+
+def estimate_parallel_layers_from_region(region, max_layers=8):
+    """
+    Estimate number of parallel knots needed from region severity.
+    """
+    if region is None:
+        return 0
+
+    # severity ≈ how many "curvature quanta"
+    layers = int(math.ceil(region["severity"]))
+
+    return min(max(1, layers), max_layers)
+
+def estimate_layers_from_region_width(width, min_trans, min_parallel):
+    if width <= 1e-6:
+        return min_trans, min_parallel
+
+    transverse = max(min_trans, int(math.ceil(min_trans / width)))
+    parallel   = max(min_parallel, int(math.ceil(min_parallel / width)))
+
+    return transverse, parallel
+
+def insert_localized_parallel_knots(bs, along_v, region, layers=8, tol=1e-9):
+    """
+    Insert parallel knots localized to hot curvature region.
+
+    Args:
+        bs: Part.BSplineSurface
+        along_v: bool - True if boundary is V=const (so refine V)
+        region: dict from estimate_parallel_refinement_need()
+        layers: int - number of layers to insert
+        tol: float - knot insertion tolerance
+    Returns:
+        bool - True if surface was modified
+    """
+    if region is None or layers <= 0:
+        return False
+    
+    u0, u1 = region["u0"], region["u1"]
+    if u1 <= u0:
+        return False
+
+    # Determine knot insertion direction
+    if not along_v:
+        insert = lambda t: bs.insertUKnot(t, 1, tol)
+    else:
+        insert = lambda t: bs.insertVKnot(t, 1, tol)
+
+    # Gaussian-like distribution around center
+    mid = 0.5 * (u0 + u1)
+    span = 0.5 * (u1 - u0)
+
+    modified = False
+    for i in range(layers):
+        # Bias toward center
+        w = (i + 1) / (layers + 1)
+        t = mid + span * (2*w - 1) * 0.6
+
+        insert(t)
         modified = True
 
     return modified
@@ -804,6 +1022,38 @@ def boundary_pole_params(bs, along_v, boundary_index):
 
     return params
 
+def boundary_sample_params(bs, along_v, samples):
+    """
+    Sample surface parameters along boundary edge.
+
+    Args:
+        bs (Part.BSplineSurface): target surface
+        along_v (bool): True if boundary/sampling direction is along V, False if along U
+        samples (int): number of samples along edge
+    Returns:
+        list of float: sampled surface parameters along boundary direction
+    """
+    params = []
+
+    if along_v:
+        # U = const boundary, iterate along V
+        v_min, v_max = bs.bounds()[2:4]
+
+        for k in range(samples):
+            s = k / (samples - 1)
+            v = v_min + s * (v_max - v_min)
+            params.append(v)
+    else:
+        # V = const boundary, iterate along U
+        u_min, u_max = bs.bounds()[0:2]
+
+        for k in range(samples):
+            s = k / (samples - 1)
+            u = u_min + s * (u_max - u_min)
+            params.append(u)
+
+    return params
+
 def get_surface_boundary_tangents(face, edge, samples = 30, pole_params = None):
     """
     Get transverse tangents at boundary poles.
@@ -1034,7 +1284,7 @@ def pole_spacing(bs, along_v, boundary_index):
 
     return sum(spacings) / max(len(spacings), 1)
 
-def estimate_refinement_layers(driver_dirs, target_dirs, beta, degree, tol=0.15, max_layers=8):
+def estimate_refinement_layers(driver_dirs, target_dirs, beta, degree, energy_tol=0.15, max_layers=8):
     """
     Estimate transverse refinement layers from predicted G1 energy
     Args:
@@ -1042,7 +1292,7 @@ def estimate_refinement_layers(driver_dirs, target_dirs, beta, degree, tol=0.15,
         target_dirs: list of App.Vector (unit) from target surface
         beta: blending factor
         degree: surface degree in refinement direction
-        tol: tolerance for acceptable energy
+        energy_tol: tolerance for acceptable energy
         max_layers: maximum allowed refinement layers
     """
 
@@ -1058,14 +1308,14 @@ def estimate_refinement_layers(driver_dirs, target_dirs, beta, degree, tol=0.15,
     # predicted dimensionless energy
     E = beta * max_mismatch / degree
 
-    if E < tol:
+    if E < energy_tol:
         return 0
     
     if E > 6.0:
         App.Console.PrintWarning(f"High predicted G1 energy={E:.2f}. G1 may not be possible.\n")
         return max_layers
 
-    layers = int(math.ceil(math.sqrt(E / tol)))
+    layers = int(math.ceil(math.sqrt(E / energy_tol)))
     return max(0, min(layers, max_layers))
 
 def resolve_constraints(desired_dirs):
@@ -1305,6 +1555,177 @@ def smooth_decay(d, max_d):
 def gaussian_decay(d, sigma):
     return math.exp(-(d*d) / (2*sigma*sigma))
 
+def needs_degree_elevation(bs, along_v, boundary_index, transverse_layers, parallel_layers):
+    """
+    Check if current degrees are insufficient for requested refinement.
+    Args:
+        bs: (Part.BSplineSurface) target surface
+        along_v: (bool) direction of boundary
+        boundary_index: (int) index of boundary row/column (0-based)
+        transverse_layers: (int) requested transverse refinement layers
+        parallel_layers: (int) requested parallel refinement layers
+    Returns:
+        (uDeg, vDeg): tuple of bool indicating if degree elevation is needed in U and V
+    """
+    udeg, vdeg = bs.UDegree, bs.VDegree
+
+    # refinement directions
+    trans_deg = vdeg if not along_v else udeg
+    para_deg  = udeg if not along_v else vdeg
+
+    (uDeg, vDeg) = (False, False)
+    
+    # heuristic safety rule
+    if transverse_layers > 2 * trans_deg:
+        vDeg |= True if not along_v else False
+        uDeg |= True if along_v else False
+    if parallel_layers > 2 * para_deg:
+        uDeg |= True if not along_v else False
+        vDeg |= True if along_v else False
+        
+    return (uDeg, vDeg)
+
+def count_poles_in_hot_region(bs, along_v, hot_region):
+    """
+    Count existing poles supporting curvature inside hot region.
+    Returns:
+        (parallel_poles, transverse_rows)
+    """
+    u0, u1 = hot_region["u0"], hot_region["u1"]
+
+    u_knots = bs.getUKnots()
+    v_knots = bs.getVKnots()
+
+    if along_v:
+        # boundary is V=const → parallel is U
+        parallel_knots = u_knots
+        transverse_knots = v_knots
+    else:
+        parallel_knots = v_knots
+        transverse_knots = u_knots
+
+    # Count knot spans overlapping hot region
+    parallel_spans = sum(
+        1 for i in range(len(parallel_knots) - 1)
+        if not (parallel_knots[i+1] <= u0 or parallel_knots[i] >= u1)
+    )
+
+    transverse_spans = len(transverse_knots) - 1
+
+    return parallel_spans, transverse_spans
+
+def relax_layers_by_existing_dof(
+    parallel_layers,
+    transverse_layers,
+    existing_parallel,
+    existing_transverse,
+    degree_parallel,
+    degree_transverse
+):
+    """
+    Reduce requested layers based on existing DOF.
+    """
+
+    parallel_capacity = existing_parallel * degree_parallel
+    transverse_capacity = existing_transverse * degree_transverse
+
+    parallel_layers = max(0, parallel_layers - parallel_capacity // 2)
+    transverse_layers = max(0, transverse_layers - transverse_capacity // 2)
+
+    return transverse_layers, parallel_layers
+
+def estimate_surface_refinement(bs, driver_dirs, target_dirs, along_v, boundary_index, beta=1.0, energy_tol=0.15, hot_angle_rad=0.2):
+    """
+    Estimates required transverse + parallel refinement layers and degree elevation
+    to achieve G1 continuity along shared edge between driver_face and target_face.
+    Args:
+        bs: (Part.BSplineSurface) target surface
+        driver_dirs: (list of App.Vector) tangent directions on driver face
+        target_dirs: (list of App.Vector) tangent directions on target face
+        along_v: (bool) True if boundary is V=const, False if U=const
+        boundary_index: (int) index of boundary row/column (0-based)
+        energy_tol: (float) tolerance for acceptable G1 energy
+        hot_angle_rad: (float) angle threshold for hot region detection (radians)
+    Returns:
+        dict with keys:
+            "transverse_layers": int
+            "parallel_layers": int
+            "hot_region": dict or None
+            "elevate_degree": (uDeg, vDeg) tuple of bool
+    """
+
+    # Transverse refinement from tangent mismatch
+    degree = bs.VDegree if not along_v else bs.UDegree
+
+    transverse_layers = estimate_refinement_layers(driver_dirs, target_dirs, beta, degree, energy_tol)
+    parallel_layers = 0
+
+    if transverse_layers <= 0:
+        return {
+            "transverse_layers": 0,
+            "parallel_layers": parallel_layers,
+            "hot_region": None,
+            "elevate_degree": (False, False)
+        }
+
+    # Angular differences
+    angles = [
+        math.acos(max(-1.0, min(1.0, abs(d.dot(t)))))
+        for d, t in zip(driver_dirs, target_dirs)
+    ]
+
+    # Hot region detection
+    samples = len(angles)
+    params = boundary_sample_params(bs, along_v, samples)
+
+    hot_region = estimate_parallel_refinement_need(params, angles, hot_angle_rad)
+
+    if hot_region:
+        parallel_layers = estimate_parallel_layers_from_region(hot_region)
+
+        print(f"Pre-estimated {transverse_layers} transverse layers and {parallel_layers} parallel layers")
+        print(f"Detected hot region between {hot_region['u0']:.4f} and {hot_region['u1']:.4f}"
+              f" with severity {hot_region['severity']:.4f} and stiffness {hot_region['ratio']:.4f}")
+        
+        # Coupled correction
+        hot_width = hot_region["u1"] - hot_region["u0"]
+        transverse_layers, parallel_layers = estimate_layers_from_region_width(hot_width, transverse_layers, parallel_layers)
+
+        print(f"Region width corrected {transverse_layers} transverse layers and {parallel_layers} parallel layers")
+
+        # relax layers based on existing DOF
+        existing_parallel, existing_transverse = count_poles_in_hot_region(bs, along_v, hot_region)
+
+        print(f"Existing poles in hot region: {existing_transverse} Transverse and {existing_parallel} Parallel")
+
+        degree_parallel = bs.UDegree if not along_v else bs.VDegree
+        degree_transverse = bs.VDegree if not along_v else bs.UDegree
+
+        transverse_layers, parallel_layers = relax_layers_by_existing_dof(
+            parallel_layers=parallel_layers,
+            transverse_layers=transverse_layers,
+            existing_parallel=existing_parallel,
+            existing_transverse=existing_transverse,
+            degree_parallel=degree_parallel,
+            degree_transverse=degree_transverse
+        )
+
+        # ensure to add at least parallel + 1 transverse layers
+        if parallel_layers > 0:
+            transverse_layers = max(transverse_layers, max(1, parallel_layers + 1))
+
+        print(f"Relaxed to {transverse_layers} transverse layers and {parallel_layers} parallel layers")
+
+
+    (uDeg, vDeg) = needs_degree_elevation(bs, along_v, boundary_index, transverse_layers, parallel_layers)
+    
+    return {
+        "transverse_layers": transverse_layers,
+        "parallel_layers": parallel_layers,
+        "hot_region": hot_region,
+        "elevate_degree": (uDeg, vDeg)
+    }
+
 def enforce_G1_multiple(target_face, drivers, collision_mode='average', refinement=None):
     """
     Enforce G1 continuity on target_face along multiple driver surfaces.
@@ -1326,6 +1747,9 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
     # Get BSpline surface from target face   
     if not isinstance(target_face.Surface, Part.BSplineSurface):
         raise RuntimeError("Target face is not a BSpline surface")
+
+    # Record the start time
+    start_time = time()
 
     refine_surface = refinement is not None and refinement.get("method", None) is not None
     bs = target_face.Surface.copy()
@@ -1355,7 +1779,7 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
 
     g1_poles = set()
     # Preprocess drivers
-    for drv in drivers:
+    for driver_idx, drv in enumerate(drivers):
         driver_face = drv['driver_face']
         samples = drv.get('samples', 30)
 
@@ -1384,26 +1808,49 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
             tol = refinement.get("tol", 1e-9)
             beta = drv.get('beta', 1.0)
            
-            # Sample tangents from driver face along edge, do not interpolate yet
-            driver_tangents_dir_samples = get_surface_boundary_tangents(driver_face, edge, samples, None)
+            driver_dirs = get_surface_boundary_tangents(driver_face, edge, samples, None)
+            target_dirs = get_surface_boundary_tangents(target_face, edge, samples, None)
 
-            # Sample tangents from target face along edge, do not interpolate yet
-            target_tangents_dir_samples = get_surface_boundary_tangents(target_face, edge, samples, None)
+            print(f"Estimating refinement for driver {driver_idx}: \n")
 
-            # estimate refinement layers from tangent mismatch
-            # Sample tangents from driver face along edge, do not interpolate yet
-            layers = estimate_refinement_layers(driver_tangents_dir_samples, target_tangents_dir_samples,
-                        beta, degree, tol=0.15)
-                        
-            if layers > 0:
-                if refinement_method == "weighted":
-                    # compute weights based on driver tangents
-                    refined |= insert_mismatch_weighted_knots(bs, not along_v, boundary_index, edge,
-                                driver_tangents_dir_samples, target_tangents_dir_samples, layers, tol)
+            while True:
+                estimate = estimate_surface_refinement(
+                    bs, driver_dirs, target_dirs, along_v, boundary_index,
+                    beta=beta, energy_tol=refinement.get("tolerance", 0.15),
+                    hot_angle_rad=refinement.get("hot_angle_rad", 0.2)
+                )
+                layers = estimate["transverse_layers"]
+                parallel_layers = estimate["parallel_layers"]
+                hot_region = estimate["hot_region"]
+                (elevate_Udeg, elevate_Vdeg) = estimate["elevate_degree"]
+                
+                print(f"Current surface degree: UDegree={bs.UDegree}, VDegree={bs.VDegree}\n")
+
+                if elevate_Udeg or elevate_Vdeg:
+                    udeg = bs.UDegree
+                    vdeg = bs.VDegree
+                    if elevate_Udeg:
+                        udeg += 1
+                    if elevate_Vdeg:
+                        vdeg += 1
+                    bs.increaseDegree(udeg, vdeg)
+
+                    boundary_index = 0 if side == 1 else (bs.NbUPoles - 1 if along_v else bs.NbVPoles - 1)
+                    refined = True
                 else:
-                    boundary_bias = refinement.get("boundary_bias", 1.2)                    
-                    refined |= insert_boundary_biased_knots(bs, not along_v, boundary_index, 
-                        layers, boundary_bias, tol)
+                    break
+
+            if parallel_layers > 0 and hot_region:
+                refined |= insert_localized_parallel_knots(bs, along_v, hot_region, parallel_layers, tol)
+            
+            if refinement_method == "weighted":
+                # compute weights based on driver tangents
+                refined |= insert_mismatch_weighted_knots(bs, not along_v, boundary_index, edge,
+                            driver_dirs, target_dirs, layers, tol)
+            else:
+                boundary_bias = refinement.get("boundary_bias", 1.2)                    
+                refined |= insert_boundary_biased_knots(bs, not along_v, boundary_index, 
+                    layers, boundary_bias, tol)
 
         # After refinement (if any) boundary index may have changed
         boundary_index = 0 if side == 1 else (bs.NbUPoles - 1 if along_v else bs.NbVPoles - 1)
@@ -1667,6 +2114,13 @@ def enforce_G1_multiple(target_face, drivers, collision_mode='average', refineme
                 bs.setWeight(i + 1, j + 1, avg_weight)
     
     # draw_points(deltas, (1.0, 0.0, 1.0), 0.2, "Faired_Poles")
+
+    # Record the end time
+    end_time = time()
+
+    # Calculate and print the elapsed time
+    elapsed_time = end_time - start_time
+    print(f"Time taken: {elapsed_time} seconds")
 
     return bs
 
